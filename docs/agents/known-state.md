@@ -83,6 +83,20 @@ MODEL_CALLS_ENABLED=true
 
 本地最终验收：新空 PostgreSQL 17.11 库迁移 39 项，598/598 后端测试和 37/37 Web 测试通过，typecheck、Web build、smoke 30 项通过。已有独立预览库增加 30 条明确虚构材料后呈现 7 个题材，其中 Top5 有澄清与待核实样例，预览库 receipts=0；原来的 12 条演示文章保留。未验证 Docker 镜像或真实模型选稿质量。
 
+## 2026-10-08 短快讯检查与部署前验收
+
+用户授权本地检查和验收，不授权生产部署。基础版本 `e6ca5d4` 已按此前用户授权提交并推送 origin 财经分支；本轮修复未提交/推送。
+
+RSS/Atom 仅短 content、没有独立摘要时会丢失材料，已最小修复为保留 excerpt，正文长度/teaser 判定和队列不变。新增五项回归先失败再通过；新空本地库后端 603/603、Web 37/37、typecheck/build/smoke 通过。另启动隔离生产模式 API/Web/Worker，topics.rank 成功、51 主题/0 信源/0 receipt，临时进程已清理。
+
+Docker Desktop 启动遇到 `dockerInference` 残留项不可访问而崩溃，单项改名保留尝试也被系统拒绝，未修改该项或 Docker 数据。容器构建仍未验收；未重置 Docker/WSL、删除卷或连接生产。详细证据、限制和后续顺序见 [部署前验收](../predeploy-validation.md)。
+
+用户随后授权修复本机 Docker。2026-10-08 12:24 本地核查：在停止本轮故障进程、确认目标仅含零字节套接字后，同父目录改名保留并重建 `Docker/run` 与 `docker-secrets-engine`，解决连续两个旧 socket 启动阻塞。Linux Engine 28.5.1 与 Compose v2.40.0 可用，能读取 2 镜像、4 volume、7 个 exited 容器。未删任何数据或备份、未改 Docker 设置、未访问秘密内容；不是永久修复或数据完整性证明。项目镜像构建和容器链路仍待下一步验收，本次授权不包含生产部署。
+
+随后用户明确授权 Docker 镜像和独立库容器验收，已完成。本地 `myhot-predeploy-20261008:finance-v1` 镜像为当前工作区（含未提交 RSS 修复），linux/amd64、Node 24.21.0、非 root；PostgreSQL/pg_dump 17.11。全新 `aihot_docker_20261008_test` 39 项迁移与 seed 通过；空站 0 来源/回执，30 虚构材料后 worker 实际生成 7 项榜单，smoke 30 与主代理 HTTP 22 项通过，运行库回执仍 0。另一新库 `aihot_docker_short_20261008_test` 的镜像内 5 项回归通过，6 张回执仅为 loopback 假 Provider。应用/db保持内部网络，用无凭据固定 upstream 的本地辅助 gateway 完成宿主 HTTP 检查。测试容器已优雅停止，原镜像/容器/volume和新增测试卷保留；未修改应用代码、实际 `.env`、生产数据，未部署、提交或推送。剩余生产容量、备份/HTTPS与真实来源/模型校准限制见 [验收报告](../predeploy-validation.md)。
+
+上述未提交、停止状态为验收结束时的观测。用户随后授权重新启动本地测试网页，`55542` 测试站保持运行，30 虚构文章、7 禁用来源、51 主题、0 回执，外部调用继续关闭。用户再明确授权将本轮 RSS 修复、5 项回归及相关文档 commit 并 push 到 origin 财经分支；具体提交与同步状态以 Git 记录为准，不包括生产部署或镜像推送。
+
 ## 更新记录的方法
 
 更新时写明日期、来源（用户确认/本地源码/服务器只读核查/推断）、适用环境和是否已实施。只保存脱敏状态与结论，不写凭据、Cookie、私钥、真实密码或完整连接串。业务/生产变更完成后按证据更新，不把本次代理配置创建记成财经改造或生产上线。

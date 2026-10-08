@@ -33,6 +33,8 @@
 
 可选：`summaryIsBody`（订阅里的摘要就是全文）、`allowCategories` / `denyCategories`（按订阅里的分类过滤）。
 
+RSS/Atom 的正文仍须超过 280 字且不是编辑来源的 teaser 才标为已确认；较短的 `content:encoded` 或 Atom `content` 即使没有单独摘要，也会保留为 excerpt。`summaryIsBody` 不会取消长度与 teaser 判定。编辑来源可能先尝试文章页提取，无法确认正文时再使用现有摘要分析，不把登录提示当成新闻正文。
+
 ### web_list
 
 支持普通 CSS 选择器，`div` 列表也能采集。关键是 `itemSelector` 要选中**每条新闻**，而不是包住所有新闻的容器。例如：
