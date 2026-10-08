@@ -7,13 +7,14 @@ import { test } from "node:test";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const BACKEND = path.join(ROOT, "packages/backend/src");
+const portablePath = (file: string) => file.split(path.sep).join("/");
 
 function sources(dir: string): Array<{ file: string; text: string }> {
   const out: Array<{ file: string; text: string }> = [];
   for (const entry of readdirSync(path.join(ROOT, dir), { withFileTypes: true, recursive: true })) {
     const full = path.join(entry.parentPath, entry.name);
     if (!entry.isFile() || !/\.tsx?$/.test(entry.name) || /[/\\](node_modules|build|\.react-router)[/\\]/.test(full)) continue;
-    out.push({ file: path.relative(ROOT, full), text: readFileSync(full, "utf8") });
+    out.push({ file: portablePath(path.relative(ROOT, full)), text: readFileSync(full, "utf8") });
   }
   return out;
 }
@@ -25,7 +26,7 @@ const specifiers = (text: string) => [...text.matchAll(/\b(?:from|import)\s*\(?\
 function backendPath(file: string, spec: string): string | null {
   if (spec.startsWith("@aihot/backend/")) return `${spec.slice("@aihot/backend/".length)}.ts`;
   if (!spec.startsWith(".")) return null;
-  const target = path.relative(BACKEND, path.resolve(ROOT, path.dirname(file), spec));
+  const target = portablePath(path.relative(BACKEND, path.resolve(ROOT, path.dirname(file), spec)));
   return target.startsWith("..") ? null : target;
 }
 
@@ -68,12 +69,13 @@ const OWNERS: Record<string, string> = {
   facts: "events/", fact_articles: "events/", stories: "events/", story_signals: "events/", story_aliases: "events/", story_links: "events/",
   story_digests: "events/", grouping_decisions: "events/", grouping_overrides: "events/", regroup_pending: "events/",
   audit_log: "audit.ts",
+  topic_hot_rankings: "events/",
 };
 
 test("the tables that carry a rule are written only by the module that owns it", () => {
   const found: string[] = [];
   for (const { file, text } of sources("packages/backend/src")) {
-    const own = path.relative("packages/backend/src", file);
+    const own = portablePath(path.relative("packages/backend/src", file));
     for (const [, table] of text.matchAll(/\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+([a-z_]+)\b/gi)) {
       const owner = OWNERS[table!.toLowerCase()];
       if (owner && !own.startsWith(owner)) found.push(`${file} writes ${table} (owner ${owner})`);

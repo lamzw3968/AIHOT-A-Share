@@ -4,17 +4,38 @@
 // local stubs by the tests that need them, and the push valves stay off. The files share
 // one database and its paid-service budgets, so they run one at a time (package.json).
 import http from "node:http";
+import { Agent, buildConnector, setGlobalDispatcher } from "undici";
 
 const database = new URL(process.env.DATABASE_URL ?? "postgres://unset/unset").pathname.slice(1);
 if (!/_(test|ci)$/.test(database)) {
   throw new Error(`Invariant tests write rows: point DATABASE_URL at a throwaway database named *_test or *_ci (got "${database}")`);
 }
 process.env.AIHOT_CREDENTIALS_DIR = "/nonexistent-test-credentials";
-process.env.SESSION_SECRET ??= "test-session-secret-0123456789";
-process.env.IMG_PROXY_SIGN_SECRET ??= "test-img-secret-0123456789";
+process.env.SESSION_SECRET = "test-session-secret-0123456789";
+process.env.IMG_PROXY_SIGN_SECRET = "test-img-secret-0123456789";
+process.env.COLLECT_ENABLED = "false";
 process.env.FEISHU_CONTENT_PUSH_ENABLED = "false";
+process.env.FEISHU_INTERNAL_ENABLED = "false";
 process.env.INDEXNOW_SUBMIT_ENABLED = "false";
 process.env.LOG_LEVEL ??= "error";
+// Model tests exercise the real receipt path against local stubs only. Remove inherited credentials
+// before modules load, and refuse real network connections even when a test enables a provider.
+for (const name of Object.keys(process.env)) {
+  if (name.endsWith("_API_KEY") || ["DAJIALA_KEY", "FEISHU_APP_SECRET", "INGEST_TOKEN", "LLM_EXTRA_JSON", "EGRESS_PROXY_URL"].includes(name)) delete process.env[name];
+}
+for (const name of ["LLM", "ZHIPU", "DEEPSEEK", "DASHSCOPE", "XIAOMI_MIMO", "EMBEDDING", "JINA", "SOCIALDATA", "DAJIALA"]) {
+  process.env[`${name}_BASE_URL`] = "http://127.0.0.1:9/v1";
+}
+process.env.MODEL_CALLS_ENABLED = "true";
+const localHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const connect = buildConnector({});
+setGlobalDispatcher(new Agent({ connect(options, callback) {
+  if (!localHosts.has(options.hostname)) {
+    callback(new Error("Invariant tests cannot connect to external services"), null);
+    return;
+  }
+  connect(options, callback);
+} }));
 // The tests were written against the named model presets AIHOT assigns to each step (each provider is
 // pointed at a local stub by the test that needs it). The open-source default is one model for every
 // step, which tests/default-model.test.ts covers.

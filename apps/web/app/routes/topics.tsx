@@ -38,10 +38,12 @@ export default function TopicsPage() {
   return (
     <div className="pb-10">
       <header className="pb-2 pt-5 lg:pt-1">
-        <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">{subjectAfter("按主题看")}</h1>
+        <h1 className="text-[24px] font-semibold leading-[1.3] text-ink">{subjectAfter("按题材看")}</h1>
         <p className="mt-1.5 text-[13px] leading-relaxed text-ink-3">
-          按{groups.map((g) => g.name).join("、")}浏览 <span className="num">{topics.length}</span> 个主题，持续汇集近期焦点与精选。
+          先看产业与关注题材，再通过机构和资讯类型查找材料。这里是固定阅读目录；每日讨论排名请查看热点榜。
         </p>
+        <Link to="/hot" prefetch="intent" className="mt-3 inline-flex text-[13px] font-semibold text-accent">查看题材热点 Top5 →</Link>
+        <p className="mt-2 text-[12px] text-ink-4">共 <span className="num">{topics.length}</span> 个阅读入口，排名与催化按已接入来源统计。</p>
       </header>
       {groups.map((g) => (
         <section key={g.key} aria-labelledby={`topics-${g.key}`} className="pt-8">

@@ -1,6 +1,7 @@
 // Public read layer, item level. Every exit (site API, v1, RSS, MCP, sitemap) reads
 // items through these functions; visibility, release gate and body licences are applied here.
 import type { CategoryKey, ChannelKey } from "@aihot/contracts/taxonomy";
+import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import type { FeedItemSummary, ItemSummary, MediaView, SourceKind, XPostView } from "@aihot/contracts/site";
 import { sql, type Db } from "../db.ts";
 import { proxiedImage, proxiedImageSet } from "../media/imgproxy.ts";
@@ -82,10 +83,8 @@ export function channelCondition(channel: ChannelKey | null | undefined) {
   return sql`AND p.channel = ${channel}`;
 }
 
-export function categoryCondition(category: CategoryKey | null | undefined, v1 = false) {
+export function categoryCondition(category: CategoryKey | null | undefined) {
   if (!category) return sql``;
-  // v1 and RSS publish opinion as tip.
-  if (v1 && category === "tip") return sql`AND p.category IN ('tip', 'opinion')`;
   return sql`AND p.category = ${category}`;
 }
 
@@ -161,7 +160,7 @@ export function toItemSummary(row: ItemRow): ItemSummary {
     publishedAt: row.published_at?.toISOString() ?? null,
     discoveredAt: row.discovered_at.toISOString(),
     timelineAt: row.timeline_at.toISOString(),
-    category: (row.category as CategoryKey | null) ?? null,
+    category: toPublicApiCategory(row.category),
     tags: displayTags(row.tags),
     score: row.score === null ? null : Math.round(Number(row.score)),
     selected: row.selected,

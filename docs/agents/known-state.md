@@ -1,24 +1,27 @@
 # 项目背景与已确认决定
 
-整理日期：2026-10-02（Asia/Shanghai）。本文件用于交接，不是待执行清单，也不授予部署、数据或付费调用权限。区分下列来源；新的用户决定和现场证据出现后更新对应记录。
+整理日期：2026-10-03（Asia/Shanghai）。本文件用于交接，不是待执行清单，也不授予部署、数据或付费调用权限。区分下列来源；新的用户决定和现场证据出现后更新对应记录。
 
-## 本地源码与代理环境：本次只读核查
+## 本地源码与代理环境：2026-10-02 财经 V1 实施
 
 - 当前工作区：`E:\AIcurser\Worktree\75e8\AIHOT`。路径是本次观察，其他 checkout/worktree 要重新发现。
 - Codex CLI 为 `0.159.0`。原生自定义代理采用 `.codex/agents/*.toml` 的 `name`、`description`、`developer_instructions`；当前会话委派工具未提供自定义角色类型参数，需按 README 的兼容方式读取角色再委派。
 - 代理建立前已有根 `AGENTS.md`、指向它的 `CLAUDE.md`、`.claude/launch.json`，以及前一阶段建立的 finance TOML 和调用文档；没有发现项目级 `.agents` 或 Skill 定义。保留现有 Claude 配置，不制造第二套路由。
-- 应用仍是 AI 示例行业：行业词 AI、AI 分类和主题、两项 AI Feature 开启。此次只建立代理体系，不修改应用配置，不应声称已经完成财经化。
+- 当前分支 `feat/finance-industry-v1`；origin 为用户 fork `lamzw3968/AIHOT-A-Share`，upstream 为 `KKKKhazix/AIHOT`。代理基础设施已提交；用户本轮批准财经 V1 本地实现与验收，不授权推送、部署、真实模型调用或历史重评。
+- 财经 V1 修改集中在 industry，另有 publication/API 最小兼容修改及测试。保留 MyHOT/myhot，行业词 A股，关闭两项 AI Feature，空信源种子；实施细节见 `docs/finance-v1.md`。本地差异不代表生产已上线。
+- 2026-10-03 本地最终验收：新空 PostgreSQL 17.11 测试库迁移 38 项，后端 579/579、Web 32/32、typecheck、Web build、smoke 30 项通过。Docker Engine 不可用，未验收容器构建；真实模型质量未校准，未推送、部署或重评生产历史。
 - Dockerfile 当前基础镜像是 `node:24-trixie-slim`，Compose 使用 `postgres:17-alpine`；行业源码和 Prompt 被复制进镜像。setup 执行 migrate 与 seed，后者对 sources 不覆盖既有 id，对 topics upsert 但不删除旧主题。
 - Source 配置字段需从 `sources/config-keys.ts` 核实。RSS/JSON 支持 `summaryIsBody`，其实际正文判定随来源形态和 teaser 检查不同，不保证一定免去详情提取。
 - external ingest 当前不直接接收 summary/bodyText；未知外部信源默认 isolated。SSRF 当前没有可配置的精确私网白名单；精确允许范围是未来设计方向，不能编造字段。
 
-## 用户已确认的财经 V1 方向：尚未实施
+## 用户已确认的财经 V1 决定
 
 - 系统是中国 A 股 / 财经热点情报系统，聚合资讯、结构化事件、摘要、研究价值、热点和日报；不做荐股、自动交易、目标价或确定涨跌预测。
 - 保留 MyHOT 站名；第一版是财经资讯与事件，不建设行情/财报数据库，只使用现有财经信源，不新增雪球或官方来源。后续用户提出新增任务时再接入。
-- 六分类和七种 ITEM_TYPES 的业务方向见 finance 定义。评分保留 0–100、两次独立调用、五维结构与原权重机制；门槛暂为 T1=60、T1_5=65、T2=76，之后用 100–200 条人工 Gold Set 校准。
-- 财经目录只显示当前财经主题，历史主题记录和旧 URL 保留；这仍需未来业务任务实现。
+- 六分类和七种 ITEM_TYPES 见当前 taxonomy。评分保留 0–100、两次独立调用、五维结构：六类事实权重 `3/1/2/4/0`，观点 `1/3/1/4/1`；门槛 T1=60、T1_5=65、T2=76，understandFloor=50，之后用 100–200 条人工 Gold Set 校准。虚构格式样例不构成校准集。
+- 财经目录只显示当前 41 个 finance- 主题并按配置排序，历史主题记录、详情 URL、计数和 sitemap 保留；不复用旧 slug。历史失效分类仅公开读取转 null，不改原值或账本。
 - 财经版关闭 leaderboard/codexResetMonitor，仅关 Feature，不删模块。站名之外的新品牌、具体信源、条款隐私和全文许可不能自行决定。
+- 用户明确确认隔离测试进程的假模型例外：虚假凭据、loopback stub、保留回执和预算；真实采集/模型/通知关闭。此例外不授权真实财经模型评测；数据库仅使用独立本地 PostgreSQL 17 `_test/_ci` 库。
 
 ## 用户提供的生产背景：本轮未连接服务器验证
 
@@ -71,6 +74,14 @@ MODEL_CALLS_ENABLED=true
 - 已有财经来源包括财联社 CLS，实际来源列表和配置应在任务授权范围内重新检查；不从历史名称猜接口或伪造 Cookie。
 - 用户报告 `https://rsshub.app` 曾 timeout，这只能说明对应路由或网络可能有问题，不能断定所有网络故障。
 - 用户报告 `https://rss.sina.com.cn/finance/jsy.xml` 曾 HTTP 200 但没有有效 `<item>`；HTTP 200 不等于 Feed 有内容。
+
+## 2026-10-08 本地题材热点改造
+
+来源：用户确认“互联网讨论热度高且可能影响相关板块”、统一 Top5，并授权按讨论修改代码。已新增题材词表与统计/公开读取/网站入口，行业目录 51 个主题，榜单词表 34 个题材，互联网 `#话题#` 可作待核实候选。不推测受益股或行情；来源组不是人数，新闻覆盖与讨论均计关注度，材料状态单列。最小增量迁移为 `0042_topic_hot_rankings.sql`，5 分钟更新，旧事件与 v1/MCP 保留。源码说明与实际验收见 `docs/topic-hot-v1.md`。
+
+本地代码授权不包括生产部署、真实外部服务、秘密配置或历史重评；原财经双评分和门槛继续保留。测试使用独立 loopback 库，任何演示材料明确虚构，不代表真实市场效果。
+
+本地最终验收：新空 PostgreSQL 17.11 库迁移 39 项，598/598 后端测试和 37/37 Web 测试通过，typecheck、Web build、smoke 30 项通过。已有独立预览库增加 30 条明确虚构材料后呈现 7 个题材，其中 Top5 有澄清与待核实样例，预览库 receipts=0；原来的 12 条演示文章保留。未验证 Docker 镜像或真实模型选稿质量。
 
 ## 更新记录的方法
 

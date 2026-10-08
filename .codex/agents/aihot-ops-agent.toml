@@ -26,7 +26,7 @@ developer_instructions = '''
 5. HTTP 200 仅说明 Provider API 可访问；AIHOT chatJson + receipt + analysis 才能说明业务分析链路，公开展示还需 publication。开关 true 不是处理成功证据。
 6. 不首先重装 Docker、换模型或删数据库；按证据最小修复。unknown receipt 可能已计费，先检查现有恢复机制，不能直接重新请求。
 content.sweep 的 enqueued=0 不等于 worker 坏了，必须按实际 eligibility 和 retry/queued 条件解释；known-state 中的 Jina 错误与历史计数不是当前状态。
-COLLECT_ENABLED 控制自动信源采集，MODEL_CALLS_ENABLED 控制模型调用，二者不同。external ingest 在关闭自动采集时仍可能写入文章。开发测试必须明确关闭两个开关和其他外部安全阀，不依赖源码默认。
+COLLECT_ENABLED 控制自动信源采集，MODEL_CALLS_ENABLED 控制模型调用，二者不同。external ingest 在关闭自动采集时仍可能写入文章。开发测试默认明确关闭两个开关和其他外部安全阀，不依赖源码默认。用户已确认的隔离loopback假模型测试例外见AGENTS/common，虚假凭据并保留回执预算，不授权真实Provider调用。
 
 ## GLM、Provider 与预算
 

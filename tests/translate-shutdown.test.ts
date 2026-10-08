@@ -9,6 +9,14 @@ import { publishArticle } from '@aihot/backend/publication/publish';
 
 const T = tag();
 const SOURCE = `test-translate-stop-${T}`;
+const stopTrigger = process.platform === 'win32' ? 'shutdown handler via IPC' : 'SIGTERM';
+
+// Windows kill('SIGTERM') bypasses the JS handler. IPC invokes the same handler in the test child;
+// POSIX uses the real OS signal. This tests handler behavior on Windows, not signal delivery.
+function requestStop(child: ReturnType<typeof spawn>) {
+  if (process.platform === 'win32') child.send({ testSignal: 'SIGTERM' });
+  else child.kill('SIGTERM');
+}
 let active: { asked: ReturnType<typeof gate<void>>; hold: ReturnType<typeof gate<void>>; calls: number; misaligned: boolean };
 const provider = await stub(async (_hit, req) => {
   const { segments } = JSON.parse(JSON.parse(req.body).messages[1].content) as { segments: string[] };
@@ -24,6 +32,7 @@ function runTranslation() {
     import { shutdownSignal } from '@aihot/backend/jobs/queue';
     import { closeDb } from '@aihot/backend/db';
     process.on('SIGTERM', () => { shutdownSignal.abort(); process.send({ stopped: true }); });
+    process.on('message', message => { if (message?.testSignal === 'SIGTERM') process.emit('SIGTERM'); });
     try { process.send({ result: await translatePending({ limit: 1 }) }); }
     finally { await closeDb(); process.disconnect(); }
   `;
@@ -49,17 +58,17 @@ before(async () => {
 });
 after(async () => { await provider.close(); await stopBoss(); await closeDb(); });
 
-for (const misaligned of [false, true]) test(`SIGTERM finishes the sent ${misaligned ? 'misaligned' : 'normal'} batch and resumes from its receipt`, async () => {
+for (const misaligned of [false, true]) test(`${stopTrigger} finishes the sent ${misaligned ? 'misaligned' : 'normal'} batch and resumes from its receipt`, async () => {
   active = { asked: gate(), hold: gate(), calls: 0, misaligned };
   const first = misaligned ? `First paragraph ${T}.` : `First paragraph ${T}. ${'English text '.repeat(170)}`;
   const second = misaligned ? `Second paragraph ${T}.` : `Second paragraph ${T}. ${'More English '.repeat(170)}`;
   const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.org/translation-shutdown-${T}/${misaligned}`, title: `Shutdown ${T}`, bodyHtml: `<p>${first}</p><p>${second}</p>`, bodyText: first + second, bodyStatus: 'ok', language: 'en', via: 'fetch', publishedAt: new Date(), discoveredAt: new Date(Date.now() + 86_400_000) });
   await sql`INSERT INTO analyses (article_id,input_revision,origin,relevance,category,title_zh,summary_zh,reason_zh,score,selected)
-    VALUES (${articleId},1,'rule','pass','ai-models',${`终止测试${T}`},'摘要','理由',90,true)`;
+    VALUES (${articleId},1,'rule','pass','company',${`终止测试${T}`},'摘要','理由',90,true)`;
   await publishArticle(articleId, { releasedAt: new Date(Date.now() - 60_000) });
   const interrupted = runTranslation();
   await Promise.race([active.asked.promise, interrupted.done.then(() => assert.fail('translation ended before a request'))]);
-  interrupted.child.kill('SIGTERM');
+  requestStop(interrupted.child);
   await interrupted.stopped;
   active.hold.open();
   assert.deepEqual(await interrupted.done, { done: [], quotes: 0 });

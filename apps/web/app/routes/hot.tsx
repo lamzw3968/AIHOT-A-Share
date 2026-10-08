@@ -1,7 +1,9 @@
-import { SITE, subjectAfter, withSubject } from "@aihot/industry/site";
-import { Link, useLoaderData } from "react-router";
+import { withSubject } from "@aihot/industry/site";
+import { data as withHeaders, Link, useLoaderData } from "react-router";
 import type { HotEntryView, HotResponse } from "@aihot/contracts/site";
-import { loadOr404 } from "../lib/api.server";
+import type { TopicHotResponse } from "@aihot/contracts/topic-hot";
+import type { Route } from "./+types/hot";
+import { loadOr404, releaseBoundCache } from "../lib/api.server";
 import { pageMeta } from "../lib/seo";
 import { monthDayTime, shortSourceName } from "../lib/format";
 import { Badge } from "../components/ui/Badge";
@@ -10,22 +12,28 @@ import { IconChevronDown, IconInfo } from "../components/icons";
 import { Sparkline } from "../features/hot/Sparkline";
 import { Faces } from "../features/hot/Faces";
 import { Delta } from "../features/hot/Delta";
+import { TopicHotBoard, TopicHotCard } from "../features/hot/TopicHotBoard";
 
 export async function loader({ request }: { request: Request }) {
-  return { hot: await loadOr404<HotResponse>("/api/site/hot", { signal: request.signal }) };
+  const upstream = new Headers();
+  const [hot, topicHot] = await Promise.all([
+    loadOr404<HotResponse>("/api/site/hot", { signal: request.signal }),
+    loadOr404<TopicHotResponse>("/api/site/topic-hot", { signal: request.signal, responseHeaders: upstream }),
+  ]);
+  return withHeaders({ hot, topicHot }, { headers: releaseBoundCache(topicHot.refreshAt, 60, Date.now(), upstream) });
 }
 
 export function meta() {
   return pageMeta({
-    title: withSubject("热点榜"),
-    description: `${subjectAfter("过去 48 小时", "圈")}讨论最多的 10 个事件：热度指数、趋势与组成热度的公开来源。`,
+    title: withSubject("题材热点榜"),
+    description: "已接入来源中的 A 股题材热点 Top5、完整排名与相关报道；新闻与讨论关注度、材料状态分别展示。",
     path: "/hot",
     image: "/og/pages/hot.png",
   });
 }
 
-export function headers() {
-  return { "Cache-Control": "public, max-age=0, s-maxage=120, stale-while-revalidate=60" };
+export function headers({ loaderHeaders }: Route.HeadersArgs) {
+  return loaderHeaders;
 }
 
 const BADGES: Record<HotEntryView["badges"][number], { label: string; tone: "hot" | "accent" | "amber"; hint: string }> = {
@@ -38,7 +46,7 @@ const RANK_COLOR = ["text-rank-1", "text-rank-2", "text-rank-3"];
 const rankColor = (rank: number) => RANK_COLOR[rank - 1] ?? "text-rank-rest";
 const pad = (rank: number) => String(rank).padStart(2, "0");
 
-/** "TechCrunch、The Verge 等 4 个来源 · 7 位参与者". */
+/** Source channels and deduplicated source groups are not a count of people. */
 function Voices({ e }: { e: HotEntryView }) {
   const names = e.sourceNames.slice(0, 2).map(shortSourceName);
   return (
@@ -50,7 +58,7 @@ function Voices({ e }: { e: HotEntryView }) {
       </span>
       <span className="mx-1.5 text-line-strong">·</span>
       <span className="whitespace-nowrap">
-        <span className="num">{e.participantCount}</span> 位参与者
+        <span className="num">{e.participantCount}</span> 个独立来源组
       </span>
     </span>
   );
@@ -169,7 +177,7 @@ function Runner({ e }: { e: HotEntryView }) {
           <Faces participants={e.participants} total={e.participantCount} size={20} />
           <span className="text-[12px] text-ink-4">
             <span className="whitespace-nowrap"><span className="num">{e.sourceCount}</span> 个来源</span> ·{" "}
-            <span className="whitespace-nowrap"><span className="num">{e.participantCount}</span> 位参与者</span>
+            <span className="whitespace-nowrap"><span className="num">{e.participantCount}</span> 个独立来源组</span>
           </span>
         </div>
         <div className="flex items-end gap-3">
@@ -222,7 +230,7 @@ function Row({ e }: { e: HotEntryView }) {
 }
 
 export default function HotPage() {
-  const { hot } = useLoaderData<typeof loader>();
+  const { hot, topicHot } = useLoaderData<typeof loader>();
   const [lead, ...rest] = hot.entries;
   const runners = rest.slice(0, 2);
   const others = rest.slice(2);
@@ -235,18 +243,31 @@ export default function HotPage() {
               <span className="absolute inline-flex size-full animate-ping rounded-full bg-hot opacity-30" />
               <span className="relative inline-flex size-2 rounded-full bg-hot" />
             </span>
-            实时热度
+            讨论与催化
           </div>
-          <h1 className="mt-1.5 text-[24px] font-bold leading-[1.3] tracking-[-0.01em] text-ink lg:text-[26px]">{withSubject("热点榜")}</h1>
-          <p className="mt-1.5 text-[13.5px] text-ink-3">过去 {hot.windowHours} 小时，{withSubject("圈")}讨论最多的 {hot.entries.length || 10} 件事</p>
+          <h1 className="mt-1.5 text-[24px] font-bold leading-[1.3] tracking-[-0.01em] text-ink lg:text-[26px]">{withSubject("题材热点榜")}</h1>
+          <p className="mt-1.5 text-[13.5px] text-ink-3">按题材汇总互联网讨论与事件催化，仅统计已接入来源。</p>
         </div>
-        {hot.computedAt && (
+        {topicHot.computedAt && (
           <p className="text-[12px] text-ink-4">
-            <span className="num">{monthDayTime(hot.computedAt)}</span> 更新 · 按讨论热度排序
+            <span className="num">{monthDayTime(topicHot.computedAt)}</span> 更新 · 按新闻与讨论关注度排序
           </p>
         )}
       </header>
 
+      <TopicHotBoard board={topicHot} />
+      {topicHot.entries.length > 5 && (
+        <section aria-label="其余题材排名" className="mb-8">
+          <h2 className="mb-3 text-[17px] font-semibold text-ink">完整榜单 · 其余题材</h2>
+          <ol start={6} className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {topicHot.entries.slice(5).map((entry) => <li key={entry.topic.slug} className="min-w-0"><TopicHotCard entry={entry} /></li>)}
+          </ol>
+        </section>
+      )}
+
+      <section aria-labelledby="event-hot-heading" className="border-t border-line-soft pt-6">
+        <h2 id="event-hot-heading" className="text-[19px] font-semibold text-ink">独立事件关注榜</h2>
+        <p className="mb-4 mt-1 text-[12.5px] leading-relaxed text-ink-4">过去 {hot.windowHours} 小时的单个事件。相同题材下不同公司的订单、公告与进展分别保留。</p>
       {!lead ? (
         <div className="card rounded-sheet">
           <EmptyState title="暂时没有热点">还没有足够多来源共同讨论的事件。</EmptyState>
@@ -270,7 +291,7 @@ export default function HotPage() {
                 <h2 className="text-[15px] font-semibold text-ink">
                   继续看 <span className="num font-normal text-ink-4">No.{pad(others[0]!.rank)}–{pad(others[others.length - 1]!.rank)}</span>
                 </h2>
-                <span className="hidden text-[12px] text-ink-4 lg:block">参与者 · 24 小时走势 · 热度指数</span>
+                <span className="hidden text-[12px] text-ink-4 lg:block">独立来源组 · 24 小时走势 · 热度指数</span>
               </div>
               <ol className="card divide-y divide-line-soft overflow-hidden">
                 {others.map((e) => (
@@ -281,6 +302,7 @@ export default function HotPage() {
           )}
         </>
       )}
+      </section>
 
       <details className="disclosure group/method mt-8 text-[12px] text-ink-4">
         <summary className="flex items-center gap-1.5 py-1 transition-colors hover:text-ink-2">
@@ -293,10 +315,11 @@ export default function HotPage() {
           </span>
         </summary>
         <div className="max-w-[760px] space-y-2 pb-2 pl-[21px] pt-2 leading-[1.75] text-ink-3">
-          <p>热度来自参与同一事件的独立账号与机构，重复采集只算一次，并按 24 小时半衰期衰减。它衡量讨论活跃程度，不是报道质量评分。</p>
+          <p>题材榜把关联同一题材的讨论与独立事件汇总；事件榜仍按单个事件统计。新闻与讨论关注度衡量已接入来源的覆盖，不表示行情表现或事实已获确认。</p>
+          <p>同一来源组在统计窗口内去重，重复抓取和同源转载不会当作新的独立证据；独立来源组不是全网讨论人数。</p>
           <p>榜单统计过去 48 小时。趋势只比较持续覆盖的同一组信源；它反映我们的监测范围，不代表全网人数。缺少可比历史时，不展示趋势线。</p>
           <p>
-            信源名单只展示可公开阅读的报道来源；讨论参与者还包括只计入热度的账号与机构。同一机构的多个渠道可能合并计数，因此参与者不一定多于信源数。点击事件可查看各方报道与观点。
+            信源名单只展示可公开阅读的报道来源；统计还可以包含只计热度的来源。同一机构的多个渠道可能合并计数。点击题材查看催化与材料，点击事件查看各方报道与观点。
           </p>
           <dl className="flex flex-wrap gap-x-5 gap-y-1.5 pt-1">
             {Object.values(BADGES).map((b) => (

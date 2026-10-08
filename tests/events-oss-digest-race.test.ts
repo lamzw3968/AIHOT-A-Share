@@ -152,7 +152,7 @@ test("撤回发生在首次归组回答之前，晚到结果不能新建可复�
   const asked = gate(); const hold = gate();
   answer = async (user) => {
     asked.open(); await hold.promise;
-    return { query: "模型发布", decisions: [...user.matchAll(/【候选 (C\d+)】/g)].map(m => ({ id: m[1], relation: "UNRELATED", confidence: 0.99, note: "不同事件" })) };
+    return { query: "公司动态", decisions: [...user.matchAll(/【候选 (C\d+)】/g)].map(m => ({ id: m[1], relation: "UNRELATED", confidence: 0.99, note: "不同事件" })) };
   };
   const run = groupArticle(a);
   await waitForCall(asked, run);

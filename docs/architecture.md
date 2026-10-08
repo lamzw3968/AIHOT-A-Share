@@ -21,6 +21,8 @@ flowchart LR
 
 业务代码都在 `packages/backend/`，前后端共用的类型和常量在 `packages/contracts/`，行业相关的一切在 `industry/`。
 
+财经版额外提供[题材热点榜](topic-hot-v1.md)：worker 将报道与讨论按行业词表关联到题材并定时写 `topic_hot_rankings`；写入归 `events/` 所有，读经 `publication/topic-hot.ts` 重查公开范围。它不合并 story，不触发模型，原事件榜与机器接口保持原样。
+
 ## 几条不变的规则
 
 - **一个公开读取层**：网页、RSS、API、MCP、站点地图、分享图读的都是 `packages/backend/src/publication/`。公开范围、发布延迟与事实证据条件只在 `publication/scope.ts` 定义；新增出口也遵循当前的撤回和全文许可。

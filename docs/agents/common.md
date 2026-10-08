@@ -42,6 +42,7 @@
 - 迁移仅可向后兼容增量追加，不能修改已应用迁移或擅自改变 schema。保留旧分析和回执；新的 Prompt 哈希不等于已触发历史重评。
 - 不读取或输出真实 `.env`、Key、密码、Cookie/token、session secret、ingest token；凭据状态只检查存在、长度和配置。使用已配置的认证通道不需要把秘密带入聊天或文件。禁止未经脱敏打印完整环境、连接串、HTTP headers、Compose 展开结果或日志。
 - 开发和测试明确设置 `COLLECT_ENABLED=false`、`MODEL_CALLS_ENABLED=false`、`FEISHU_CONTENT_PUSH_ENABLED=false`、`FEISHU_INTERNAL_ENABLED=false`、`INDEXNOW_SUBMIT_ENABLED=false`；源码默认值不能当作关闭。测试服务仅用本地固定样本/假 Provider。
+- 财经 V1 用户确认的测试例外：隔离测试进程可受控启用 loopback 假模型通路，使用虚假凭据，保留预算、回执和关闭安全阀的断言。不得继承真实模型凭据或发送外部请求；运行功能开关的断言不构成授权真实采集。该例外只验证流程契约，不证明模型质量已校准。
 - 真实采集、模型验证和 Gold Set 评测按主代理明确任务及费用范围执行，仍经过原回执预算；unknown receipt 可能已计费，先查恢复机制，不直接重发。
 
 ## Git 与验证

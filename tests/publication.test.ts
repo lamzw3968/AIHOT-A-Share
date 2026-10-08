@@ -51,7 +51,7 @@ async function article(): Promise<string> {
     sourceId: SOURCE, url: `https://example.com/${T}-${n}`, title: `Test ${n}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`, bodyStatus: "ok", via: "fetch", publishedAt: new Date(),
   });
   await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
-            VALUES (${articleId}, 1, 'rule', 'pass', 'ai-models', ${`标题${n}-${T}`}, ${`SUMMARY-${n}-${T}`}, '理由', 90, true)`;
+            VALUES (${articleId}, 1, 'rule', 'pass', 'company', ${`标题${n}-${T}`}, ${`SUMMARY-${n}-${T}`}, '理由', 90, true)`;
   return articleId;
 }
 
@@ -124,7 +124,7 @@ test("a withdrawn item leaves every report exit", async () => {
   const id = await article();
   await publishArticle(id, released());
   const content = {
-    sections: [{ label: "模型", items: [{ itemId: id, title: `LEAD-${T}`, summary: `QUOTED-${T}`, sourceUrl: `https://example.com/original-${T}`, sourceName: "Test" }] }],
+    sections: [{ label: "公司", items: [{ itemId: id, title: `LEAD-${T}`, summary: `QUOTED-${T}`, sourceUrl: `https://example.com/original-${T}`, sourceName: "Test" }] }],
     flashes: [],
   };
   await sql`INSERT INTO reports (kind, key, window_start, window_end, content, generated_at, origin)
@@ -151,7 +151,7 @@ test("weekly v1 exposes published issues with stable lookup, caching and withdra
   const content = {
     overview: `OVERVIEW-${T}`,
     themes: [{
-      heading: "模型",
+      heading: "公司",
       summary: `THEME-${T}`,
       storyRefs: [{
         itemId: id,
@@ -197,7 +197,7 @@ test("monthly v1 exposes published issues with stable lookup, caching and withdr
   const content = {
     overview: `OVERVIEW-${T}`,
     themes: [{
-      heading: "模型",
+      heading: "公司",
       summary: `THEME-${T}`,
       storyRefs: [{
         itemId: id,
@@ -418,7 +418,7 @@ test("share images keep detail metadata and access rules while conditional reads
   const id = await article();
   await publishArticle(id, released());
   const d = JSON.parse((await get(`/api/site/items/${id}`)).body);
-  const kicker = d.category ? CATEGORY_LABELS[d.category as keyof typeof CATEGORY_LABELS] : "AI 动态";
+  const kicker = d.category ? CATEGORY_LABELS[d.category as keyof typeof CATEGORY_LABELS] : "A股动态";
   const source = d.source.name.replace(/（[^）]*）\s*$/, "");
   const date = beijingDate(d.timelineAt);
   const card = { kicker, title: d.title, subtitle: d.summary, meta: `${source} · ${date}`,

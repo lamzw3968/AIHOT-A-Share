@@ -1,6 +1,7 @@
 import { listedCondition, selectedCondition } from "./scope.ts";
 // v1 items and the selected sync (snapshot + changes), read from the same public read layer.
 import type { PublicApiCategoryKey } from "@aihot/contracts/taxonomy";
+import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import { sql, type Db } from "../db.ts";
 import { decodeCursor, encodeCursor, InvalidCursorError, queryBinding } from "../lib/cursor.ts";
 import { newShortId } from "../lib/ids.ts";
@@ -52,7 +53,7 @@ export async function v1Items(query: V1ItemsQuery, now = new Date()): Promise<V1
 
   const run = (db: Db) => db<(ApiItemRow & { sort_at: Date })[]>`
     SELECT ${API_ITEM_COLUMNS}, ${sortCol} AS sort_at ${API_ITEM_FROM}
-    WHERE ${scope} ${categoryCondition(query.category, true)} ${publicMatchCondition(terms)}
+    WHERE ${scope} ${categoryCondition(query.category)} ${publicMatchCondition(terms)}
       AND ${sortCol} >= ${windowStart} AND ${sortCol} <= ${now}
       ${after ? sql`AND (${sortCol}, p.article_id) < (${new Date(after.a)}, ${after.i})` : sql``}
     ORDER BY ${sortCol} DESC, p.article_id DESC
@@ -105,6 +106,11 @@ export async function effectiveWatermark(now = new Date()): Promise<number> {
     SELECT coalesce((SELECT min(seq) - 1 FROM selected_ledger WHERE visible_at > ${now}),
                     (SELECT coalesce(max(seq), 0) FROM selected_ledger)) AS w`;
   return Number(row?.w ?? 0);
+}
+
+// Old ledger entries remain immutable; only the public projection uses today's vocabulary.
+function publicPayload(item: V1ItemPayload): V1ItemPayload {
+  return { ...item, category: toPublicApiCategory(item.category) };
 }
 
 function minimalOf(item: V1ItemPayload) {
@@ -183,7 +189,7 @@ export async function selectedSnapshot(q: SnapshotQuery, now = new Date()) {
     count: page.length,
     hasMore,
     nextPage: hasMore && last ? encodeCursor(SYNC_PREFIX, { k: "page", e: epoch, w, f: fields, a: last.article_id, t: asOf }) : null,
-    items: page.map((r) => (fields === "minimal" ? minimalOf(r.payload) : r.payload)),
+    items: page.map((r) => (fields === "minimal" ? minimalOf(publicPayload(r.payload)) : publicPayload(r.payload))),
   };
 }
 
@@ -223,7 +229,7 @@ export async function selectedChanges(q: { cursor: string; limit: number }, now 
     changes: page.map((r) =>
       r.op === "remove"
         ? { op: "remove" as const, changedAt: r.changed_at.toISOString(), id: r.article_id }
-        : { op: "upsert" as const, changedAt: r.changed_at.toISOString(), item: c.f === "minimal" ? minimalOf(r.payload!) : r.payload! },
+        : { op: "upsert" as const, changedAt: r.changed_at.toISOString(), item: c.f === "minimal" ? minimalOf(publicPayload(r.payload!)) : publicPayload(r.payload!) },
     ),
   };
 }

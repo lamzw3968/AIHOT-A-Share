@@ -15,17 +15,17 @@ import { QUEUES, stopBoss } from "@aihot/backend/jobs/queue";
 import { republishSource } from "@aihot/backend/publication/publish";
 
 const T = tag();
-const BODY = `A lab released a new AI model with benchmark results and pricing details. ${T} `.repeat(12);
+const BODY = `A company disclosed a storage contract with its amount and execution stage. ${T} `.repeat(12);
 const originalConfig = { modelCallsEnabled: config.modelCallsEnabled, allowPrivateNetworkFetch: config.allowPrivateNetworkFetch };
 const provider = await stub((_hit, req) => {
   const body = JSON.parse(req.body) as { messages: Array<{ role: string; content: string }> };
   const system = body.messages[0]?.role === "system" ? body.messages[0].content : "";
   const input = JSON.stringify(body.messages);
   let answer: unknown;
-  if (system.includes("宽召回的AI相关性预筛")) answer = { label: input.includes("OFFTOPIC") ? "BLOCK" : "PASS", reason: "测试" };
+  if (system.includes("宽召回的财经相关性预筛")) answer = { label: input.includes("OFFTOPIC") ? "BLOCK" : "PASS", reason: "测试" };
   else if (system.includes("事件注意力评分器")) answer = { attentionScore: 80 };
-  else if (system.includes("内容理解编辑")) answer = { itemType: "model_release", authorRole: "principal", tags: ["模型发布"], editorialJudgment: "测试判断", titleZh: "某实验室发布新模型", summaryZh: "某实验室发布新模型，并公布评测结果和价格。" };
-  else if (system.includes("资料结构化助手")) answer = { category: "ai-models", tags: ["模型发布"], subjects: [], fact: { title: "某实验室发布新模型" } };
+  else if (system.includes("内容理解编辑")) answer = { itemType: "company_event", authorRole: "principal", tags: ["公司动态"], editorialJudgment: "测试判断", titleZh: "某公司披露新订单", summaryZh: "某公司披露新订单，并公布金额与履行阶段。" };
+  else if (system.includes("资料结构化助手")) answer = { category: "company", tags: ["公司动态"], subjects: [], fact: { title: "某公司披露新订单" } };
   else throw new Error("unexpected model request");
   return { id: "stub", choices: [{ message: { content: JSON.stringify(answer) } }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } };
 });
@@ -37,7 +37,7 @@ let pageHits = 0;
 const page = http.createServer((_req, res) => {
   pageHits += 1;
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-  res.end(`<html><head><title>Model release</title></head><body><article><h1>Model release</h1><p>${BODY}</p></article></body></html>`);
+  res.end(`<html><head><title>Company contract</title></head><body><article><h1>Company contract</h1><p>${BODY}</p></article></body></html>`);
 });
 await new Promise<void>((resolve) => page.listen(0, "127.0.0.1", resolve));
 const pageUrl = `http://127.0.0.1:${(page.address() as { port: number }).port}`;
@@ -76,7 +76,7 @@ async function source(suffix: string, mode = "isolated") {
 
 async function material(sourceId: string, suffix: string, extra: Record<string, unknown> = {}) {
   return (await upsertMaterial({
-    sourceId, url: `${pageUrl}/${T}-${suffix}`, title: `Model release ${T} ${suffix}`, bodyText: BODY, bodyStatus: "ok",
+    sourceId, url: `${pageUrl}/${T}-${suffix}`, title: `Company contract ${T} ${suffix}`, bodyText: BODY, bodyStatus: "ok",
     via: "fetch", publishedAt: new Date(), ...extra,
   } as Parameters<typeof upsertMaterial>[0])).articleId;
 }
@@ -92,7 +92,7 @@ test("source details preserve the configured first-party identity at every tier"
 
 test("promoting a settled auto-created source resumes normal editorial extraction", async () => {
   const sourceId = `test-promote-${T}-ingest`;
-  assert.deepEqual(await ingestItems({ sourceId, items: [{ title: `Model release ${T}`, url: `${pageUrl}/${T}-ingest`, publishedAt: new Date().toISOString() }] }), { ok: true, created: 1 });
+  assert.deepEqual(await ingestItems({ sourceId, items: [{ title: `Company contract ${T}`, url: `${pageUrl}/${T}-ingest`, publishedAt: new Date().toISOString() }] }), { ok: true, created: 1 });
   const [article] = await sql<{ id: string }[]>`SELECT id FROM articles WHERE source_id = ${sourceId}`;
   const id = article!.id;
   await settleNonEditorial(id);
@@ -131,8 +131,8 @@ test("resumed extraction and analysis publish the fetched body at its current re
   const [publication] = await sql`SELECT eligible, visibility, title, summary FROM publications WHERE article_id = ${id}`;
   assert.equal(publication!.eligible, true);
   assert.equal(publication!.visibility, "public");
-  assert.match(String(publication!.title), /实验室/);
-  assert.match(String(publication!.summary), /评测/);
+  assert.match(String(publication!.title), /公司披露新订单/);
+  assert.match(String(publication!.summary), /金额与履行阶段/);
   assert.ok(provider.hits() >= 5, "normal budgeted model stages used the local fixture");
 });
 

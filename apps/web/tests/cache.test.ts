@@ -38,6 +38,13 @@ const api = createServer((req, res) => {
       ? { topic, items: [], page: 1, pageCount: 1, refreshAt } : { topics: [topic], refreshAt }));
   }
   if (url.pathname === "/api/site/hot") return res.end(JSON.stringify({ entries: [] }));
+  if (url.pathname === "/api/site/topic-hot") {
+    res.setHeader("X-Accel-Expires", `@${deadline}`);
+    return res.end(JSON.stringify({ computedAt: null, ruleVersion: "fixture", windowHours: 48, compareHours: 6,
+      halfLifeHours: 24, topCount: 5, refreshAt, stale: false, entries: [], marketDataAvailable: false,
+      coverage: { countBasis: "source-groups", sourceCount: 0, discussionSourceCount: 0, platformCount: 0,
+        behindSourceCount: 0, behindSourceNames: [], inputCount: 0, truncated: false, interactionMetricsAvailable: false } }));
+  }
   if (url.pathname === "/api/site/echo-client") return res.end(JSON.stringify({ forwarded: req.headers["x-forwarded-for"], real: req.headers["x-real-ip"] }));
   if (url.pathname === "/api/site/items/long-lived") return res.end(JSON.stringify({ id: "long-lived", title: "t" }));
   if (url.pathname === "/api/site/contact") return res.end(JSON.stringify({ wechatQr: "/qr.png", feishuQr: "/qr.png" }));
@@ -116,6 +123,17 @@ test("HTML and navigation share freshness; cookies do not personalize public res
   assert.equal(signedIn.headers.get("Set-Cookie"), null);
   assert.equal(await signedIn.text(), await plain.text());
   assert.ok(apiCookies.every((cookie) => !cookie));
+});
+
+test("finance SSR hides AI module navigation and disabled pages return 404", async () => {
+  const response = await fetch(`${origin}/`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.doesNotMatch(html, /href="\/(?:leaderboard|codex-reset)(?:[\/"?#])/);
+  for (const route of ["/leaderboard", "/leaderboard/rules", "/leaderboard/sources", "/codex-reset", "/codex-reset/history/2026-10-02"]) {
+    const disabled = await fetch(`${origin}${route}`);
+    assert.equal(disabled.status, 404, route);
+  }
 });
 
 test("missing routes cannot be hidden by a root-only request; errors and redirects stay uncached", async () => {

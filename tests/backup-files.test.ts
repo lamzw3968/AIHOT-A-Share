@@ -3,10 +3,10 @@ import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { after, beforeEach, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 import { promisify } from "node:util";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
@@ -25,10 +25,63 @@ const env = {
 const originalEnv = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
 Object.assign(process.env, env);
 const roots: string[] = [];
+const originalPath = process.env.PATH;
+let windowsTar: string | null = null;
 const databases = new Set<string>();
 const objects = new Map<string, Buffer>();
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
 const NOW = new Date("2026-11-01T04:00:00Z");
+
+// Windows cannot execute a shebang script or read /dev/null. The test-only executable still invokes
+// the real system tar; it adapts the empty list and the same failure counter used by the POSIX shim.
+before(async () => {
+  if (process.platform !== "win32") return;
+  const bin = await mkdtemp(path.join(tmpdir(), "aihot-backup-tar-"));
+  roots.push(bin);
+  const source = path.join(bin, "tar.cs");
+  windowsTar = path.join(bin, "tar.exe");
+  await writeFile(source, String.raw`
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+class TestTar {
+  static string Quote(string value) {
+    var text = new StringBuilder("\""); int slashes = 0;
+    foreach (char c in value) {
+      if (c == '\\') { slashes++; continue; }
+      text.Append('\\', c == '"' ? slashes * 2 + 1 : slashes);
+      text.Append(c); slashes = 0;
+    }
+    text.Append('\\', slashes * 2); return text.Append('"').ToString();
+  }
+  static int Main(string[] args) {
+    var countFile = Environment.GetEnvironmentVariable("BACKUP_TEST_COUNT");
+    if (!String.IsNullOrEmpty(countFile) && Array.IndexOf(args, "-czf") >= 0) {
+      int count = File.Exists(countFile) ? Int32.Parse(File.ReadAllText(countFile)) : 0;
+      File.WriteAllText(countFile, (++count).ToString());
+      if (count <= Int32.Parse(Environment.GetEnvironmentVariable("BACKUP_TEST_FAILURES"))) {
+        Console.Error.WriteLine("fictional packing failure"); return 2;
+      }
+    }
+    string empty = null;
+    for (int i = 0; i < args.Length; i++) if (args[i] == "/dev/null") {
+      empty = Path.GetTempFileName(); args[i] = empty;
+    }
+    try {
+      var command = Environment.GetEnvironmentVariable("BACKUP_TEST_TAR")
+        ?? Path.Combine(Environment.GetEnvironmentVariable("SystemRoot"), "System32", "tar.exe");
+      var quoted = Array.ConvertAll(args, Quote);
+      var start = new ProcessStartInfo(command, String.Join(" ", quoted));
+      start.UseShellExecute = false; start.CreateNoWindow = true;
+      using (var child = Process.Start(start)) { child.WaitForExit(); return child.ExitCode; }
+    } finally { if (empty != null) File.Delete(empty); }
+  }
+}`);
+  const compiler = path.join(process.env.SystemRoot ?? "C:\\Windows", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+  await run(compiler, ["/nologo", "/target:exe", `/out:${windowsTar}`, source]);
+  process.env.PATH = `${bin}${path.delimiter}${originalPath}`;
+});
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
@@ -50,6 +103,7 @@ beforeEach(async () => {
 });
 after(async () => {
   globalThis.fetch = originalFetch;
+  if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
   config.dataDir = originalDataDir;
   for (const [key, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -162,10 +216,13 @@ async function withPackingFailures(failures: number, action: (count: () => Promi
   const bin = path.join(config.dataDir, "test-bin");
   await mkdir(bin);
   const countFile = path.join(bin, "count");
-  const realTar = (await run("sh", ["-c", "command -v tar"])).stdout.trim();
+  const realTar = process.platform === "win32"
+    ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe")
+    : (await run("sh", ["-c", "command -v tar"])).stdout.trim();
   assert.ok(path.isAbsolute(realTar));
   // 仅替换测试进程的命令查找；恢复与成功路径仍执行真正的 tar。
-  await writeFile(path.join(bin, "tar"), `#!/bin/sh
+  if (windowsTar) await copyFile(windowsTar, path.join(bin, "tar.exe"));
+  else await writeFile(path.join(bin, "tar"), `#!/bin/sh
 n=0
 if [ -f "$BACKUP_TEST_COUNT" ]; then n=$(cat "$BACKUP_TEST_COUNT"); fi
 n=$((n+1))
@@ -173,7 +230,7 @@ printf '%s' "$n" > "$BACKUP_TEST_COUNT"
 if [ "$n" -le "$BACKUP_TEST_FAILURES" ]; then echo 'fictional packing failure' >&2; exit 2; fi
 exec "$BACKUP_TEST_TAR" "$@"
 `, { mode: 0o755 });
-  const replacement = { PATH: `${bin}:${process.env.PATH}`, BACKUP_TEST_COUNT: countFile, BACKUP_TEST_FAILURES: String(failures), BACKUP_TEST_TAR: realTar };
+  const replacement = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, BACKUP_TEST_COUNT: countFile, BACKUP_TEST_FAILURES: String(failures), BACKUP_TEST_TAR: realTar };
   const previous = Object.fromEntries(Object.keys(replacement).map(key => [key, process.env[key]]));
   Object.assign(process.env, replacement);
   try { await action(async () => Number(await readFile(countFile, "utf8"))); }

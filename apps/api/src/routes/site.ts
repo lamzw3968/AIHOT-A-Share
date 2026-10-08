@@ -11,6 +11,7 @@ import { loadStoryFollowups } from "@aihot/backend/publication/followups";
 import { loadDevelopments, loadGroupReports } from "@aihot/backend/publication/groups";
 import { loadTopicTags } from "@aihot/backend/publication/topics";
 import { loadHotStrip } from "@aihot/backend/publication/hot";
+import { loadTopicHot, loadTopicHotDetail } from "@aihot/backend/publication/topic-hot";
 import { loadChangelog, siteMeta } from "@aihot/backend/site/meta";
 import { loadContact, loadMakerAvatar } from "@aihot/backend/site/contact";
 import { loadSiteStats } from "@aihot/backend/site/stats";
@@ -188,6 +189,17 @@ export function registerSite(app: FastifyInstance) {
   }));
 
   registerFeedback(app);
+
+  app.get("/api/site/topic-hot", siteHandler(async (req, reply) => {
+    const data = await loadTopicHot();
+    return sendJsonWithEtag(req, reply, data, { etagPrefix: "topic-hot", cacheControl: cacheUntil(reply, 30, data.refreshAt) });
+  }));
+
+  app.get("/api/site/topic-hot/:slug", siteHandler(async (req, reply) => {
+    const data = await loadTopicHotDetail((req.params as { slug: string }).slug);
+    if (!data) return sendProblem(req, reply, { status: 404, code: "not_found", detail: "topic hotspot not found", cacheControl: "no-store" });
+    return sendJsonWithEtag(req, reply, data, { etagPrefix: "topic-hot-detail", cacheControl: cacheUntil(reply, 30, data.board.refreshAt) });
+  }));
 
 
   app.get("/api/site/hot", siteHandler(async (req, reply) => {

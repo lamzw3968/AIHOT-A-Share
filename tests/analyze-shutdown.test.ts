@@ -25,7 +25,7 @@ let active: {
 const provider = await stub(async (_hit, request) => {
   const body = JSON.parse(request.body);
   const system = String(body.messages[0]?.content ?? "");
-  const step: Step = system.includes("宽召回的AI相关性预筛") ? "prefilter" : system.includes("事件注意力评分器") ? "score"
+  const step: Step = system.includes("宽召回的财经相关性预筛") ? "prefilter" : system.includes("事件注意力评分器") ? "score"
     : system.includes("资料结构化助手") ? "structure" : "understand";
   active.calls.push(step);
   const count = active.calls.filter(s => s === step).length;
@@ -35,13 +35,21 @@ const provider = await stub(async (_hit, request) => {
   }
   if (step === "structure" && count === 1) { active.structureAsked.open(); await active.structureAnswer.promise; }
   if (step === "understand" && active.writingAnswer) { active.writingAsked!.open(); await active.writingAnswer.promise; }
-  const content = step === "prefilter" ? { label: "PASS", reason: "AI model release" }
+  const content = step === "prefilter" ? { label: "PASS", reason: "company contract" }
     : step === "score" ? { attentionScore: 80 }
-      : step === "structure" ? { category: "ai-models", tags: ["模型发布"], subjects: [], fact: { title: "新模型发布" } }
-        : { itemType: "model_release", authorRole: "principal", tags: ["模型发布"], editorialJudgment: "模型有明确的能力提升", titleZh: `新模型发布 ${T}`, summaryZh: "模型发布并提供了评测和价格。" };
+      : step === "structure" ? { category: "company", tags: ["公司动态"], subjects: [], fact: { title: "新公司动态" } }
+        : { itemType: "company_event", authorRole: "principal", tags: ["公司动态"], editorialJudgment: "订单有明确的金额与执行阶段", titleZh: `新公司动态 ${T}`, summaryZh: "公司动态并提供了评测和价格。" };
   return { id: `stub-${active.calls.length}`, choices: [{ message: { content: JSON.stringify(content) } }], usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 } };
 });
 const children = new Set<ReturnType<typeof spawn>>();
+const stopTrigger = process.platform === "win32" ? "shutdown handler via IPC" : "SIGTERM";
+
+// Windows kill('SIGTERM') terminates Node without running its JS signal handler. Invoke that same
+// handler over the test IPC channel there; POSIX continues to exercise the real OS signal.
+function requestStop(child: ReturnType<typeof spawn>) {
+  if (process.platform === "win32") child.send({ testSignal: "SIGTERM" });
+  else child.kill("SIGTERM");
+}
 
 function worker(queue: string) {
   const script = `
@@ -59,6 +67,7 @@ function worker(queue: string) {
       await closeDb();
       process.disconnect();
     });
+    process.on('message', message => { if (message?.testSignal === 'SIGTERM') process.emit('SIGTERM'); });
     await registerContentJobs(await getBoss(), 1);
     process.send({ ready: true });
   `;
@@ -90,23 +99,26 @@ before(async () => {
 });
 after(async () => {
   active?.scoreAnswer.open(); active?.structureAnswer.open(); active?.writingAnswer?.open();
-  for (const child of children) child.kill("SIGTERM");
+  for (const child of children) {
+    if (child.connected) requestStop(child);
+    else child.kill("SIGTERM"); // Force cleanup of a child whose test IPC channel already closed.
+  }
   await provider.close(); await stopBoss(); await closeDb();
 });
 
-test("SIGTERM during the final paid writing call still commits the complete analysis and publication", async () => {
+test(`${stopTrigger} during the final paid writing call still commits the complete analysis and publication`, async () => {
   active = { calls: [], scoreAsked: gate(), structureAsked: gate(), scoreAnswer: gate(), structureAnswer: gate(), writingAsked: gate(), writingAnswer: gate(), failScore: false };
   active.scoreAnswer.open(); active.structureAnswer.open();
   const queue = `test.analyze-stop-${T}-final`;
   const boss = await getBoss();
   await boss.createQueue(queue, { policy: "short", retryLimit: 4, retryDelay: 1, expireInSeconds: 120 });
-  const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.org/analyze-stop-${T}/final`, title: `Final model release ${T}`,
-    bodyText: `A lab released a new AI model with benchmarks and prices. ${T} ` + "The release explains model capabilities and evaluation results. ".repeat(10),
+  const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.org/analyze-stop-${T}/final`, title: `Final company contract ${T}`,
+    bodyText: `A company signed a storage contract with its amount and execution stage. ${T} ` + "The announcement explains the contract amount and execution stage. ".repeat(10),
     bodyStatus: "ok", language: "en", via: "fetch", publishedAt: new Date() });
   const jobId = await boss.send(queue, { articleId }, { singletonKey: articleId });
   const running = worker(queue);
   await Promise.race([Promise.all([running.ready, active.writingAsked!.promise]), running.done.then(() => assert.fail("worker exited before writing"))]);
-  running.child.kill("SIGTERM"); await running.stopping;
+  requestStop(running.child); await running.stopping;
   active.writingAnswer!.open(); await running.done;
   assert.deepEqual(active.calls.slice().sort(), ["prefilter", "score", "score", "structure", "understand"]);
   assert.equal((await sql`SELECT state FROM pgboss.job WHERE id=${jobId}`)[0]!.state, "completed");
@@ -117,20 +129,20 @@ test("SIGTERM during the final paid writing call still commits the complete anal
   assert.equal((await sql`SELECT 1 FROM receipts WHERE subject=${`article:${articleId}@1`} AND status='completed'`).length, 5);
 });
 
-for (const failScore of [false, true]) test(`SIGTERM during ${failScore ? "failed" : "successful"} first score drains slower structure and leaves a retryable job`, async () => {
+for (const failScore of [false, true]) test(`${stopTrigger} during ${failScore ? "failed" : "successful"} first score drains slower structure and leaves a retryable job`, async () => {
   active = { calls: [], scoreAsked: gate(), structureAsked: gate(), scoreAnswer: gate(), structureAnswer: gate(), failScore };
   const queue = `test.analyze-stop-${T}-${failScore}`;
   const boss = await getBoss();
   // Isolate this real pg-boss worker from articles queued by the other invariant tests.
   await boss.createQueue(queue, { policy: "short", retryLimit: 4, retryDelay: 1, expireInSeconds: 120 });
-  const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.org/analyze-stop-${T}/${failScore}`, title: `A new model released ${T} ${failScore}`,
-    bodyText: `A lab released a new AI model with benchmarks and prices. ${T} ${failScore} ` + "The release explains model capabilities and evaluation results. ".repeat(10),
+  const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.org/analyze-stop-${T}/${failScore}`, title: `A new contract signed ${T} ${failScore}`,
+    bodyText: `A company signed a storage contract with its amount and execution stage. ${T} ${failScore} ` + "The announcement explains the contract amount and execution stage. ".repeat(10),
     bodyStatus: "ok", language: "en", via: "fetch", publishedAt: new Date() });
   await sql`UPDATE articles SET processing_attempts=2,processing_error='prior temporary failure',processing_queued_at=now() WHERE id=${articleId}`;
   const jobId = await boss.send(queue, { articleId }, { singletonKey: articleId });
   const first = worker(queue);
   await Promise.race([Promise.all([first.ready, active.scoreAsked.promise, active.structureAsked.promise]), first.done.then(() => assert.fail("worker exited before both requests"))]);
-  first.child.kill("SIGTERM"); await first.stopping;
+  requestStop(first.child); await first.stopping;
   active.scoreAnswer.open();
   await until(async () => !!(await sql`SELECT 1 FROM receipts WHERE subject=${`article:${articleId}@1`} AND purpose='score_article' AND status IN ('received','failed')`)[0], "score receipt");
   assert.equal(first.child.exitCode, null, "the process stays alive while structure owns a paid response");
@@ -146,7 +158,7 @@ for (const failScore of [false, true]) test(`SIGTERM during ${failScore ? "faile
   assert.equal((await sql`SELECT state FROM pgboss.job WHERE id=${jobId}`)[0]!.state, "retry", "pg-boss owns restart recovery");
   const restarted = worker(queue); await restarted.ready;
   await until(async () => (await sql`SELECT state FROM pgboss.job WHERE id=${jobId}`)[0]?.state === "completed", "completed retry");
-  restarted.child.kill("SIGTERM"); await restarted.done;
+  requestStop(restarted.child); await restarted.done;
   assert.equal(active.calls.filter(s => s === "prefilter").length, 1);
   assert.equal(active.calls.filter(s => s === "structure").length, 1, "the slow structure answer was saved and reused");
   assert.equal(active.calls.filter(s => s === "score").length, failScore ? 3 : 2, "two ordered successful scores, only a rejected request repeats");

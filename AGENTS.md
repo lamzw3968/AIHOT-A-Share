@@ -7,6 +7,7 @@
 - `api` 提供网站、后台与公开接口；`worker` 采集、调用模型、归组和成刊；`web` 只通过 HTTP 读 API。数据库、模型与密钥只在后端，页面读取不触发模型。
 - Web、RSS、公开 API、MCP 等出口统一从 `packages/backend/src/publication/` 读取。公开内容匿名一致，后台仅管理员。
 - 付费请求必须经过 `providers/receipts.ts` 和预算熔断。开发、测试明确关闭 `COLLECT_ENABLED`、`MODEL_CALLS_ENABLED`、`FEISHU_*_ENABLED`、`INDEXNOW_SUBMIT_ENABLED`，测试不访问外部服务。
+- 用户已确认财经 V1 本地假模型测试例外：只在隔离测试进程、虚假凭据、loopback stub 下受控开启模型通路，保留回执/预算和安全阀断言；真实采集、模型、通知仍关闭。该例外不授权真实 Provider 评测或生产调用。
 - 行业定制优先在 `industry/`，按 `docs/customize.md` 操作。全文展示默认关闭，只有明确授权的来源才开放；不用 AIHOT 名称或 Logo 作为本站品牌。
 - 站名、信源、重要性与噪声、分类、条款和隐私以用户确认的决定为准；未确认的不自行决定。
 

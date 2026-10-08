@@ -9,6 +9,7 @@ import { adaptIntervals, scheduleDueSources } from "@aihot/backend/sources/colle
 import { scheduleMpReconcile } from "@aihot/backend/sources/mp";
 import { refreshSourceIcons } from "@aihot/backend/sources/icons";
 import { computeHotRanking, snapshotHeat } from "@aihot/backend/events/hot";
+import { computeTopicHotRanking } from "@aihot/backend/events/topic-heat";
 import { refreshStoryStatuses } from "@aihot/backend/events/digest";
 import { linkRelatedStories } from "@aihot/backend/events/consolidate";
 import { catchUpReports, composeDaily, composeMonthly, composeWeekly, dueDaily, dueWeekly, dueMonthly } from "@aihot/backend/reports/compose";
@@ -37,6 +38,7 @@ export const SCHEDULES: Scheduled[] = [
   // Full-text translations of newly selected items (model calls; off with MODEL_CALLS_ENABLED=false).
   { name: "content.translate", cron: "*/5 * * * *", run: () => translatePending() },
   { name: "hot.rank", cron: "*/5 * * * *", run: () => computeHotRanking() },
+  { name: "topics.rank", cron: "*/5 * * * *", run: () => computeTopicHotRanking() },
   { name: "hot.snapshot", cron: "2 * * * *", run: () => snapshotHeat() },
   { name: "stories.status", cron: "7 * * * *", run: refreshStoryStatuses },
   { name: "stories.links", cron: "12 * * * *", run: linkRelatedStories },
