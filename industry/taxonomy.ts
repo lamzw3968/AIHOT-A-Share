@@ -71,7 +71,11 @@ export const IDENTITY_LEXICON: ReadonlyArray<{ id: string; name: string; pattern
   { id: "szse", name: "深交所", patterns: [/深圳证券交易所|深交所|Shenzhen Stock Exchange/i] },
   { id: "bse", name: "北交所", patterns: [/北京证券交易所|北交所|Beijing Stock Exchange/i] },
   { id: "pboc", name: "中国人民银行", patterns: [/中国人民银行|中国央行|People['’]s Bank of China|\bPBOC\b/i] },
-  { id: "nbs", name: "国家统计局", patterns: [/国家统计局|National Bureau of Statistics of China/i] },
+  { id: "nbs", name: "国家统计局", patterns: [
+    /(?:中国|中华人民共和国)国家统计局|\bNational Bureau of Statistics of China\b/i,
+    // 简称仅从句首/标点或其后的据/根据归因开始，不截取地域修饰词内的子串；空格本身不是机构边界。
+    /(?:^|[\p{P}\r\n])\s*(?:据\s*|根据\s*)?国家统计局/u,
+  ] },
   { id: "hkex", name: "港交所", patterns: [/香港交易所|香港交易及结算所有限公司|港交所|\bHKEX\b/i] },
 ];
 

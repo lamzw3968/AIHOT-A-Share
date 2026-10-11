@@ -297,6 +297,87 @@ test("identity protection rejects invented institutions and keeps unknown compan
   }
 });
 
+test("NBS identity recognizes Chinese names and local attribution without accepting a bare acronym", () => {
+  for (const mention of [
+    "中国国家统计局发布数据", "据中国国家统计局数据", "中华人民共和国国家统计局发布数据",
+    "国家统计局数据显示增长", "据国家统计局发布的数据", "根据国家统计局数据",
+    "报道指出，国家统计局发布数据", "报道指出：根据国家统计局数据", "“国家统计局”发布数据",
+    "\n  据 国家统计局发布的数据", "National Bureau of Statistics of China reports data",
+    "national bureau of statistics of china (NBS) reports data",
+  ]) {
+    assert.deepEqual(matchEntityIds([mention]), ["nbs"], mention);
+    const input = { title: mention, text: mention, sourceKind: "rss" };
+    assert.equal(enforceIdentity(input, { titleZh: "国家统计局发布数据", summaryZh: "据国家统计局数据，相关指标变化。" }).identityGuard.outcome, "pass", mention);
+  }
+  for (const mention of ["NBS", "nbs reports data", "XNBSA", "NBS of Nigeria", "National Bureau of Statistics", "National Bureau of Statistics of ChinaTown", "XNational Bureau of Statistics of China"]) {
+    assert.deepEqual(matchEntityIds([mention]), [], mention);
+    assert.deepEqual(enforceIdentity({ title: mention, text: mention, sourceKind: "rss" }, {
+      titleZh: "中国国家统计局发布数据", summaryZh: "国家统计局披露经济指标。",
+    }).identityGuard, { outcome: "fallback", unsupportedTitleEntityIds: ["nbs"], unsupportedSummaryEntityIds: ["nbs"] }, mention);
+  }
+});
+
+test("foreign statistics bureaus cannot authorize Chinese NBS titles or summaries", () => {
+  for (const country of ["英国", "越南", "尼日利亚", "坦桑尼亚", "虚构甲国"]) {
+    const institution = `${country}国家统计局`;
+    const input = { title: `${institution}发布数据`, text: `${institution}披露当地经济指标。`, sourceKind: "rss" };
+    for (const mention of [input.title, `据${institution}数据`, `根据${institution}数据`, `${country} 国家统计局发布数据`]) {
+      assert.deepEqual(matchEntityIds([mention]), [], mention);
+    }
+    assert.deepEqual(enforceIdentity(input, { titleZh: input.title, summaryZh: input.text }), {
+      titleZh: input.title, summaryZh: input.text,
+      identityGuard: { outcome: "pass", unsupportedTitleEntityIds: [], unsupportedSummaryEntityIds: [] },
+    }, institution);
+    for (const titleZh of ["中国国家统计局发布数据", "国家统计局发布数据"]) {
+      assert.deepEqual(enforceIdentity(input, { titleZh, summaryZh: input.text }), {
+        titleZh: input.title, summaryZh: input.text,
+        identityGuard: { outcome: "fallback", unsupportedTitleEntityIds: ["nbs"], unsupportedSummaryEntityIds: [] },
+      }, `${institution}: ${titleZh}`);
+    }
+    for (const summaryZh of ["中国国家统计局披露经济指标。", "根据国家统计局数据，相关指标变化。", "国家统计局披露经济指标。"]) {
+      assert.deepEqual(enforceIdentity(input, { titleZh: input.title, summaryZh }), {
+        titleZh: input.title, summaryZh: "",
+        identityGuard: { outcome: "fallback", unsupportedTitleEntityIds: [], unsupportedSummaryEntityIds: ["nbs"] },
+      }, `${institution}: ${summaryZh}`);
+    }
+  }
+});
+
+test("NBS evidence stays local to each mention across material and source context", () => {
+  const foreign = "尼日利亚国家统计局发布数据";
+  const chinese = "根据国家统计局数据，相关指标变化。";
+  const copy = { titleZh: "中国国家统计局发布数据", summaryZh: "国家统计局披露经济指标。" };
+  const input = { title: "经济指标报道", text: "报道披露当地经济指标。", sourceKind: "rss" };
+  for (const field of ["title", "text", "mainText", "quotedText", "sourceName"] as const) {
+    const guarded = enforceIdentity({ ...input, [field]: foreign }, copy);
+    assert.deepEqual(guarded.identityGuard, {
+      outcome: "fallback", unsupportedTitleEntityIds: ["nbs"], unsupportedSummaryEntityIds: ["nbs"],
+    }, field);
+  }
+  for (const text of [`${foreign}；${chinese}`, `${chinese}另有${foreign}。`]) {
+    assert.deepEqual(matchEntityIds([text]), ["nbs"], text);
+    assert.equal(enforceIdentity({ ...input, text }, copy).identityGuard.outcome, "pass", text);
+  }
+  assert.deepEqual(matchEntityIds([foreign, "中国国家统计局发布数据"]), ["nbs"]);
+  assert.deepEqual(matchEntityIds(["中国国家统计局发布数据", foreign]), ["nbs"]);
+});
+
+test("NBS boundary rules preserve the other six institution identities", () => {
+  const unknown = { title: "虚构甲公司披露订单", text: "虚构甲公司披露订单金额和履行阶段。", sourceKind: "rss" };
+  for (const [id, mention, name] of [
+    ["csrc", "CSRC", "中国证监会"], ["sse", "Shanghai Stock Exchange", "上交所"],
+    ["szse", "Shenzhen Stock Exchange", "深交所"], ["bse", "Beijing Stock Exchange", "北交所"],
+    ["pboc", "People's Bank of China", "中国人民银行"], ["hkex", "HKEX", "港交所"],
+  ]) {
+    assert.deepEqual(matchEntityIds([`${mention}发布通知`]), [id], mention);
+    const copy = { titleZh: `${name}发布通知`, summaryZh: `${name}披露规则调整。` };
+    assert.equal(enforceIdentity({ ...unknown, title: `${mention}发布通知` }, copy).identityGuard.outcome, "pass", mention);
+    assert.deepEqual(enforceIdentity(unknown, copy).identityGuard, {
+      outcome: "fallback", unsupportedTitleEntityIds: [id], unsupportedSummaryEntityIds: [id],
+    }, mention);
+  }
+});
+
 test("fictional selection and relation Gold samples retain evaluation formats without claiming calibration", () => {
   const selection = readIndustry("gold.example.jsonl").trim().split(/\r?\n/).map(line => JSON.parse(line));
   assert.equal(selection.length, 2);
