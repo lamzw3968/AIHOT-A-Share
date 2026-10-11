@@ -6,6 +6,7 @@ import { REPO_ROOT } from "../config.ts";
 import { sql } from "../db.ts";
 import { cached } from "../lib/cache.ts";
 import { ITEM_COLUMNS, ITEM_FROM, toFeedItemSummary, type ItemRow } from "./items.ts";
+import catalog from "../../../../industry/topics.json" with { type: "json" };
 
 export interface TopicRow {
   slug: string;
@@ -160,7 +161,10 @@ export async function listTopicSummaries(now?: Date): Promise<TopicSummary[]> {
 export async function loadTopicDirectory(now?: Date): Promise<{ topics: TopicSummary[]; refreshAt: string | null }> {
   const [topics, snapshot] = await Promise.all([listTopics(), topicCountSnapshot(now)]);
   const counts = new Map(snapshot.counts.map((c) => [c.slug, c]));
-  const summaries = topics.map((t) => {
+  const bySlug = new Map(topics.map((t) => [t.slug, t]));
+  // The directory follows the active industry pack; historical detail URLs still use all rows.
+  const current = catalog.topics.map((t) => bySlug.get(t.slug)).filter((t): t is TopicRow => !!t);
+  const summaries = current.map((t) => {
     const c = counts.get(t.slug);
     return { slug: t.slug, name: t.name, group: t.grp, definition: t.definition, total: c?.total ?? 0, recent: c?.recent ?? 0, indexable: c?.indexable ?? false, latestAt: c?.latest?.toISOString() ?? null };
   });

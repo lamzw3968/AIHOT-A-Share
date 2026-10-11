@@ -91,14 +91,16 @@ export function isTeaser(text: string): boolean {
 }
 
 /**
- * The body and excerpt of a feed entry: its text when it is the article, else no body (a summary, or
- * a teaser that stands in as the excerpt when the entry has none).
+ * The body and excerpt of a feed entry: its text when it is the article, else no body. Rejected
+ * short content and teasers still supply an excerpt when the entry has no separate summary.
  */
 function feedText(bodyHtml: string | null, summaryHtml: string, source: SourceRow): Pick<Candidate, "excerpt" | "bodyHtml" | "bodyText" | "bodyStatus"> {
   const bodyText = bodyHtml ? stripTags(bodyHtml) : null;
   const teaser = !!bodyText && source.participation_mode === "editorial" && isTeaser(bodyText);
-  const excerpt = summaryHtml ? collapseWhitespace(stripTags(summaryHtml)).slice(0, 2000) : teaser ? collapseWhitespace(bodyText!) : null;
-  return bodyText && bodyText.length > 280 && !teaser
+  const fullBody = !!bodyText && bodyText.length > 280 && !teaser;
+  const excerpt = summaryHtml ? collapseWhitespace(stripTags(summaryHtml)).slice(0, 2000)
+    : !fullBody && bodyText ? collapseWhitespace(bodyText).slice(0, 2000) : null;
+  return fullBody
     ? { excerpt, bodyHtml, bodyText, bodyStatus: "ok" }
     : { excerpt, bodyHtml: null, bodyText: null, bodyStatus: "pending" };
 }

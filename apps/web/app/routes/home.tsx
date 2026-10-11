@@ -1,13 +1,13 @@
-import { SITE, withSubject } from "@aihot/industry/site";
 import { data as withHeaders, redirect, useLoaderData } from "react-router";
 import type { Route } from "./+types/home";
 import type { TimelineResponse } from "@aihot/contracts/site";
+import type { TopicHotResponse } from "@aihot/contracts/topic-hot";
 import { isCategoryKey, isChannelKey } from "@aihot/contracts/taxonomy";
 import { loadOr404, queryString, releaseBoundCache } from "../lib/api.server";
 import { listPath, organizationLd, pageMeta } from "../lib/seo";
 import { Wordmark } from "../components/Logo";
 import { Timeline } from "../features/feed/Timeline";
-import { HotTopics } from "../features/feed/HotTopics";
+import { TopicHotBoard } from "../features/hot/TopicHotBoard";
 import { CategoryTabs, SearchField, SearchIconLink } from "../features/feed/Filters";
 import { beijingDate, beijingWeekday } from "../lib/format";
 
@@ -22,8 +22,17 @@ export async function loader({ request }: Route.LoaderArgs) {
   const category = categoryParam && isCategoryKey(categoryParam) ? categoryParam : null;
   const tag = url.searchParams.get("tag")?.trim() || null;
   const upstream = new Headers();
-  const data = await loadOr404<TimelineResponse>(`/api/site/timeline${queryString({ channel: channel === "all" ? null : channel, category, tag })}`, { responseHeaders: upstream, signal: request.signal });
-  return withHeaders({ data, filters: { channel, category, tag, topic: null } }, { headers: releaseBoundCache(data.refreshAt, 60, Date.now(), upstream) });
+  const hotHeaders = new Headers();
+  const [data, topicHot] = await Promise.all([
+    loadOr404<TimelineResponse>(`/api/site/timeline${queryString({ channel: channel === "all" ? null : channel, category, tag })}`, { responseHeaders: upstream, signal: request.signal }),
+    loadOr404<TopicHotResponse>("/api/site/topic-hot", { responseHeaders: hotHeaders, signal: request.signal }),
+  ]);
+  const now = Date.now();
+  const timelineCache = releaseBoundCache(data.refreshAt, 60, now, upstream);
+  const topicCache = releaseBoundCache(topicHot.refreshAt, 60, now, hotHeaders);
+  const deadline = Math.min(Number(timelineCache["X-Accel-Expires"].replace("@", "")), Number(topicCache["X-Accel-Expires"].replace("@", "")));
+  const headers = releaseBoundCache(deadline ? new Date(deadline * 1000).toISOString() : new Date(now).toISOString(), 60, now);
+  return withHeaders({ data, topicHot, filters: { channel, category, tag, topic: null } }, { headers });
 }
 
 export function meta({ loaderData }: Route.MetaArgs) {
@@ -47,7 +56,7 @@ function TodayLabel() {
 }
 
 export default function Home() {
-  const { data, filters } = useLoaderData<typeof loader>();
+  const { data, topicHot, filters } = useLoaderData<typeof loader>();
   const title = filters.tag ? `#${filters.tag}` : "精选";
   return (
     <div className="pb-6">
@@ -64,7 +73,7 @@ export default function Home() {
         </div>
       </div>
 
-      {data.hot && <HotTopics entries={data.hot} />}
+      <TopicHotBoard board={topicHot} more />
 
       <h2 className="mt-6 text-[20px] font-bold text-ink lg:hidden">{filters.tag ? title : "最新精选"}</h2>
       <div className="-mx-4 mt-3 flex items-center gap-2 pl-4 pr-2 lg:hidden">

@@ -1,6 +1,6 @@
 # 信源
 
-信源在后台“信源”页管理：新建、试抓一次看看抓到什么、改频率、启停、看失败原因和最近的条目。首次启动时，`industry/sources.json` 里的示范信源会被导入。
+信源在后台“信源”页管理：新建、试抓一次看看抓到什么、改频率、启停、看失败原因和最近的条目。财经 V1 的 `industry/sources.json` 是空列表，新空数据库需另行配置来源；seed 不删除或覆盖既有来源，也不会自动停用旧 AI 来源。V1 沿用已配置财经来源，不新增来源或依赖 Jina。
 
 ## 六种信源
 
@@ -32,6 +32,8 @@
 ```
 
 可选：`summaryIsBody`（订阅里的摘要就是全文）、`allowCategories` / `denyCategories`（按订阅里的分类过滤）。
+
+RSS/Atom 的正文仍须超过 280 字且不是编辑来源的 teaser 才标为已确认；较短的 `content:encoded` 或 Atom `content` 即使没有单独摘要，也会保留为 excerpt。`summaryIsBody` 不会取消长度与 teaser 判定。编辑来源可能先尝试文章页提取，无法确认正文时再使用现有摘要分析，不把登录提示当成新闻正文。
 
 ### web_list
 

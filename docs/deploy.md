@@ -4,8 +4,10 @@
 
 需要一台装了 Docker（带 Compose）的机器。云服务器建议至少 2 核、4 GB 内存，构建镜像时要用到。
 
+当前 MyHOT 财经版使用用户 fork 的财经分支。约 1 GB 内存的服务器优先使用在同架构、内存充足的机器上构建的镜像；swap 不能替代构建与运行的实测验收。最新本地检查和未完成项见 [部署前验收](predeploy-validation.md)。
+
 ```bash
-git clone https://github.com/KKKKhazix/AIHOT.git myhot
+git clone --branch feat/finance-industry-v1 https://github.com/lamzw3968/AIHOT-A-Share.git myhot
 cd myhot
 node scripts/init-env.ts --llm-key <你的模型 API Key>
 ```
@@ -26,7 +28,7 @@ RSS、分享链接、站点地图和 Agent Markdown 中的绝对链接都使用�
 docker compose up -d --build
 ```
 
-启动后打开 `http://服务器地址:3000`，后台在 `/admin`，用管理员密码登录。第一次启动会导入示范信源，一两分钟后开始出现内容；第一次导入的一百多条资料大约半小时处理完（每条都要预筛、评分，入选的还要写标题摘要）。
+启动后打开 `http://服务器地址:3000`，后台在 `/admin`，用管理员密码登录。当前财经版的信源种子为空，首次启动只同步主题目录，不会自动导入来源或产生新闻。通过 `/admin/sources` 配置信源并预览有效条目后，确认 Worker 运行以及采集、模型开关和预算；保存信源不保证已经分析或公开发布。升级时既有数据库来源保留，重复 seed 不覆盖它们。
 
 `docker compose` 会起五个容器：`db`（PostgreSQL 17）、`setup`（每次启动先跑数据库迁移和种子数据，然后退出）、`api`、`worker`（抓取、模型处理、定时任务）、`web`（网页）。
 

@@ -7,7 +7,7 @@ import { closeDb, sql } from "@aihot/backend/db";
 import { upsertMaterial } from "@aihot/backend/content/materials";
 import { stopBoss } from "@aihot/backend/jobs/queue";
 import { publishArticle } from "@aihot/backend/publication/publish";
-import { loadTopicPage } from "@aihot/backend/publication/topics";
+import { loadTopicPage, type TopicRow } from "@aihot/backend/publication/topics";
 import { buildApp } from "../apps/api/src/app.ts";
 
 const T = tag();
@@ -16,7 +16,12 @@ const START = Math.floor(Date.now() / 1000) * 1000;
 const RELEASE = START + 180_000;
 const DAY = 86_400_000;
 const app = await buildApp();
-const slug = (name: string) => `${T}-${name}`;
+const currentSlugs: Record<string, string> = {
+  page: "finance-semiconductors", index: "finance-robotics", recent: "finance-innovative-drugs",
+  fifty: "finance-new-energy", excluded: "finance-real-estate", entity: "finance-csrc", empty: "finance-auto",
+};
+const slug = (name: string) => currentSlugs[name] ?? `${T}-${name}`;
+let savedTopics: TopicRow[] = [];
 const ids: string[] = [];
 after(async () => {
   await app.close();
@@ -27,6 +32,8 @@ after(async () => {
   }
   await sql`DELETE FROM sources WHERE id=${SOURCE}`;
   await sql`DELETE FROM topics WHERE slug LIKE ${T + '-%'}`;
+  await sql`DELETE FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
+  if (savedTopics.length) await sql`INSERT INTO topics ${sql(savedTopics)}`;
   await stopBoss();
   await closeDb();
 });
@@ -34,7 +41,7 @@ async function article(name: string, tags: string[], timeline: number, pending =
   const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.test/${T}/${name}`, title: `原文 ${name}`, bodyText: "测试正文", bodyStatus: "ok", via: "fetch", publishedAt: new Date(timeline), discoveredAt: new Date(timeline) });
   ids.push(articleId);
   await sql`INSERT INTO analyses (article_id,input_revision,origin,relevance,category,title_zh,summary_zh,reason_zh,score,selected,tags)
-    VALUES (${articleId},1,'rule','pass','ai-models',${`标题 ${name}`},'测试摘要','理由',90,true,${tags})`;
+    VALUES (${articleId},1,'rule','pass','company',${`标题 ${name}`},'测试摘要','理由',90,true,${tags})`;
   await publishArticle(articleId, pending ? {} : { releasedAt: new Date(START - DAY) });
   return articleId;
 }
@@ -52,10 +59,15 @@ test("主题的真实发布、统计和缓存共享时间门槛", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: START });
   assert.equal(config.selectedVisibleAfterSeconds, 180, "保留默认三分钟发布延迟");
   await sql`INSERT INTO sources(id,name,kind,tier,participation_mode,next_fetch_at) VALUES(${SOURCE},'主题测试','rss','T1','editorial','2100-01-01')`;
+  savedTopics = await sql<TopicRow[]>`SELECT * FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
+  await sql`DELETE FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
   for (const name of ["page", "index", "recent", "fifty", "excluded", "entity", "empty"]) {
     await sql`INSERT INTO topics(slug,name,grp,entity_id,tags,definition,related,position)
       VALUES(${slug(name)},${name},${name === "entity" ? "company" : "field"},${name === "entity" ? T : null},${[slug(name), slug(name) + "-alias"]},'测试主题',${[]},1000)`;
   }
+  await sql`INSERT INTO topics(slug,name,grp,tags,definition,position)
+    VALUES(${slug("legacy")},'旧行业主题','field',${[slug("legacy")]},'历史主题保留',-1)`;
+  for (let i = 0; i < 20; i++) await article(`legacy-${i}`, [slug("legacy")], START - DAY - i * 1000);
   for (const [name, size] of [["page", 20], ["index", 19], ["recent", 19], ["fifty", 50]] as const) {
     for (let i = 0; i < size; i++) await article(`${name}-${i}`, [slug(name), slug(name) + "-alias"], START - (name === "recent" || name === "fifty" ? 31 * DAY : DAY) - i * 1000);
   }
@@ -80,6 +92,11 @@ test("主题的真实发布、统计和缓存共享时间门槛", async (t) => {
   await t.test("发布前不提前计数、索引或产生空分页", async () => {
     assert.equal(beforeDirectory.statusCode, 200);
     const directory = beforeDirectory.json();
+    assert.equal(topic(directory, "legacy"), undefined, "old industry topic is absent from current directory");
+    const legacy = await get(`/api/site/topics/${slug("legacy")}`);
+    assert.equal(legacy.statusCode, 200);
+    assert.equal(legacy.json().topic.total, 20);
+    assert.ok(beforeSitemap.body.includes(`/topics/${slug("legacy")}</loc>`), "historical URL stays in sitemap");
     assert.deepEqual([topic(directory, "page").total, topic(directory, "page").recent], [20, 20]);
     assert.deepEqual([topic(directory, "index").total, topic(directory, "index").indexable], [19, false]);
     assert.equal(topic(directory, "page").latestAt, new Date(START - DAY).toISOString());

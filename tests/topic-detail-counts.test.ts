@@ -3,18 +3,26 @@ import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
-import { loadTopicDirectory, loadTopicPage, listTopics } from "@aihot/backend/publication/topics";
+import { loadTopicDirectory, loadTopicPage, listTopics, type TopicRow } from "@aihot/backend/publication/topics";
+import catalog from "../industry/topics.json" with { type: "json" };
 
 const T = tag();
 const SOURCE = `topic-counts-${T}`;
 const DAY = 86_400_000;
 const NOW = Date.parse("2026-03-07T12:00:00Z");
-const slug = (name: string) => `${T}-${name}`;
+const currentSlugs: Record<string, string> = {
+  company: "finance-csrc", field: "finance-semiconductors", genre: "finance-market-moves",
+  empty: "finance-robotics", edited: "finance-innovative-drugs", deleted: "finance-real-estate",
+};
+const slug = (name: string) => currentSlugs[name] ?? `${T}-${name}`;
+let savedTopics: TopicRow[] = [];
 const ids: string[] = [];
 after(async () => {
   await sql`DELETE FROM articles WHERE source_id=${SOURCE}`;
   await sql`DELETE FROM sources WHERE id=${SOURCE}`;
   await sql`DELETE FROM topics WHERE slug LIKE ${T + '-%'}`;
+  await sql`DELETE FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
+  if (savedTopics.length) await sql`INSERT INTO topics ${sql(savedTopics)}`;
   await closeDb();
 });
 
@@ -48,6 +56,8 @@ async function equivalent(name: string, at = NOW, page = 1) {
 test("topic detail preserves count, metadata and global deadline semantics", async t => {
   await sql`INSERT INTO sources(id,name,kind,tier,participation_mode,next_fetch_at)
     VALUES(${SOURCE},'Topic count tests','rss','T1','editorial','2100-01-01')`;
+  savedTopics = await sql<TopicRow[]>`SELECT * FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
+  await sql`DELETE FROM topics WHERE slug = ANY(${Object.values(currentSlugs)}::text[])`;
   for (const [name, group, entity, tags] of [
     ["field", "field", null, [slug("match"), slug("alias"), slug("match")]],
     ["company", "company", T, [slug("match")]],
@@ -75,6 +85,8 @@ test("topic detail preserves count, metadata and global deadline semantics", asy
   }
 
   await t.test("overlap counts once, company subject wins, empty tags and related metadata survive", async () => {
+    const directory = await loadTopicDirectory(new Date(NOW));
+    assert.deepEqual(directory.topics.map(t => t.slug), catalog.topics.map(t => t.slug).filter(s => directory.topics.some(t => t.slug === s)), "directory follows catalog order rather than database position");
     const field = await equivalent("field");
     assert.deepEqual([field.topic.total, field.topic.recent, field.topic.indexable, field.pageCount], [50, 20, true, 3]);
     assert.deepEqual(field.topic.related, ["empty", "field", "empty"].map(name => ({ slug: slug(name), name })));

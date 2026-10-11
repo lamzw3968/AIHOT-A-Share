@@ -38,7 +38,7 @@ interface Result {
   meta: { split: string; promptVersion: string };
   model: string;
   reportPath: string;
-  summary: { decisive: number; errors: number; accuracy: number; tokensIn: number; tokensOut: number };
+  summary: { decisive: number; errors: number; accuracy: number; tokensIn: number; tokensOut: number; wallSeconds: number };
   cases: Array<{ caseId: string; decision: string | null; error: string | null }>;
 }
 
@@ -50,6 +50,7 @@ async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: 
     writeFileSync(gold, rows.map((item) => JSON.stringify(item)).join("\n"));
     const args = ["scripts/eval-selection.ts", "--gold", gold, "--concurrency", "6", "--no-import"];
     if (opts.split) args.push("--split", opts.split);
+    const started = performance.now();
     const { stdout } = await exec(process.execPath, args, {
       cwd: REPO_ROOT,
       env: {
@@ -64,6 +65,7 @@ async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: 
       },
       timeout: 20_000,
     });
+    const elapsedSeconds = (performance.now() - started) / 1000;
     reportPath = stdout.split("\n").find((line) => line.startsWith("report: "))?.slice(8);
     assert.ok(reportPath, stdout);
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as {
@@ -71,6 +73,9 @@ async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: 
       models: Record<string, { summary: Result["summary"]; cases: Result["cases"] }>;
     };
     const model = Object.keys(report.models)[0]!;
+    const wallSeconds = report.models[model]!.summary.wallSeconds;
+    assert.ok(Number.isInteger(wallSeconds) && wallSeconds >= 0, "reported wall time is a nonnegative whole second");
+    assert.ok(wallSeconds <= Math.round(elapsedSeconds), "evaluation wall time fits within its subprocess lifetime");
     return { meta: report.meta, model, reportPath, summary: report.models[model]!.summary, cases: report.models[model]!.cases };
   } finally {
     if (reportPath) rmSync(reportPath, { force: true });
@@ -119,7 +124,11 @@ test("default evaluation follows the production score route and shares duplicate
     const warm = await evaluate(rows, { prefilter: prefilter.url, score: score.url });
 
     assert.equal(cold.model, "glm-5.3-flash-selection", "no --models follows SCORE_MODEL / production routing");
-    assert.deepEqual(cold.summary, warm.summary, "cold and cached evaluations keep the same coverage and metrics");
+    // Cache hits can change elapsed time. Validate it against each subprocess lifetime above;
+    // every coverage, scoring and usage metric must remain identical.
+    const { wallSeconds: coldWallSeconds, ...coldMetrics } = cold.summary;
+    const { wallSeconds: warmWallSeconds, ...warmMetrics } = warm.summary;
+    assert.deepEqual(coldMetrics, warmMetrics, "cold and cached evaluations keep the same coverage and metrics");
     assert.deepEqual(cold.cases.map((item) => item.decision), ["select", "reject"], "the shared score still uses each tier's threshold");
     assert.deepEqual([cold.summary.decisive, cold.summary.errors, cold.summary.accuracy], [2, 0, 1]);
     assert.deepEqual([prefilter.hits(), score.hits()], [2, 2], "two per-case prefilters, two shared score calls across both runs");
