@@ -1,7 +1,7 @@
 // Pure text/platform association tests: no database, collection or model provider.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { matchTopicSignals, platformOf } from "@aihot/backend/sources/topic-signals";
+import { createTopicSignalCache, matchTopicSignals, platformOf, type TopicSignalInput } from "@aihot/backend/sources/topic-signals";
 
 const slugs = (input: Parameters<typeof matchTopicSignals>[0]) => matchTopicSignals(input).map(topic => topic.slug);
 
@@ -88,6 +88,79 @@ test("matching input is bounded without discarding trusted tags", () => {
   assert.deepEqual(slugs({ title: `${"无".repeat(1000)}光模块`, bodyText: `${"无".repeat(20_000)}机器人` }), []);
   assert.deepEqual(slugs({ title: "空标题", tags: [...Array(64).fill("无"), "光通信"] }), []);
   assert.deepEqual(slugs({ title: "空标题", tags: ["光通信"] }), ["finance-optical-communications"]);
+});
+
+test("topic matching cache reuses bounded effective inputs, including empty matches", () => {
+  let calls = 0;
+  const cache = createTopicSignalCache({ match: () => { calls++; return []; } });
+  cache.match({ title: "空标题" });
+  cache.match({ title: "空标题", bodyText: "", tags: [], sourceTags: [], discussion: false });
+  assert.equal(calls, 1, "empty results and default fields share the same key");
+  const input = { title: "无".repeat(1000), bodyText: "无".repeat(20_000),
+    tags: Array(64).fill("无".repeat(96)), sourceTags: Array(64).fill("无".repeat(96)) };
+  cache.match(input);
+  cache.match({ ...input, title: input.title + "光模块", bodyText: input.bodyText + "机器人",
+    tags: [...input.tags.map(tag => tag + "光通信"), "液冷"], sourceTags: [...input.sourceTags, "财经"] });
+  assert.equal(calls, 2, "values beyond the matching limits do not create another entry");
+});
+
+test("topic matching cache invalidates every text input and the configuration version", () => {
+  let calls = 0, version = "first";
+  const cache = createTopicSignalCache({ version: () => version, match: input => { calls++; return matchTopicSignals(input); } });
+  const input: TopicSignalInput = { title: "普通标题", bodyText: "", tags: [], sourceTags: [], discussion: false };
+  cache.match(input);
+  for (const changed of [
+    { title: "光模块" }, { bodyText: "液冷" }, { tags: ["机器人"] }, { sourceTags: ["财经"] }, { discussion: true },
+  ]) cache.match({ ...input, ...changed });
+  assert.equal(calls, 6);
+  version = "second";
+  cache.match(input);
+  assert.equal(calls, 7);
+});
+
+test("topic matching cache isolates returned objects and evicts the least recently used input", () => {
+  let calls = 0;
+  const cache = createTopicSignalCache({ maxEntries: 2,
+    match: input => { calls++; return [{ slug: input.title, name: input.title, candidate: false }]; } });
+  const first = cache.match({ title: "first" });
+  first[0].name = "corrupted"; first.push({ slug: "extra", name: "extra", candidate: true });
+  cache.match({ title: "second" });
+  assert.deepEqual(cache.match({ title: "first" }), [{ slug: "first", name: "first", candidate: false }]);
+  cache.match({ title: "third" });
+  cache.match({ title: "second" });
+  assert.equal(calls, 4, "the hit keeps first, then inserting third evicts second");
+  assert.throws(() => createTopicSignalCache({ maxEntries: 0 }), /bounds/);
+});
+
+test("prepared matching yields, deduplicates and survives concurrent LRU eviction without fallback", async () => {
+  let calls = 0, callback = false;
+  const cache = createTopicSignalCache({ maxEntries: 2, batchSize: 1,
+    match: input => { calls++; return [{ slug: input.title, name: input.title, candidate: false }]; } });
+  setImmediate(() => { callback = true; });
+  const prepared = await cache.prepare([{ title: "first" }, { title: "first" }, { title: "second" }]);
+  assert.equal(callback, true, "cold preparation lets an already scheduled callback run");
+  assert.equal(calls, 2);
+  await cache.prepare([{ title: "third" }, { title: "fourth" }]);
+  const before = calls;
+  assert.deepEqual(prepared.run(() => cache.match({ title: "first" })), [{ slug: "first", name: "first", candidate: false }]);
+  assert.equal(calls, before, "prepared results do not depend on the process LRU retaining their keys");
+  assert.equal(prepared.has({ title: "first", tags: [], sourceTags: [] }), true);
+  assert.equal(prepared.has({ title: "changed" }), false);
+  assert.throws(() => prepared.run(() => cache.match({ title: "changed" })), /changed after preparation/);
+  assert.equal(calls, before, "an unexpected key cannot restart synchronous matching");
+});
+
+test("overlapping preparations share synchronous cache fills and keep their scopes separate", async () => {
+  let calls = 0;
+  const cache = createTopicSignalCache({ batchSize: 1,
+    match: input => { calls++; return [{ slug: input.title, name: input.title, candidate: false }]; } });
+  const [one, two] = await Promise.all([
+    cache.prepare([{ title: "shared" }, { title: "one" }]), cache.prepare([{ title: "shared" }, { title: "two" }]),
+  ]);
+  assert.equal(calls, 3);
+  assert.equal(one.run(() => cache.match({ title: "one" }))[0].name, "one");
+  assert.equal(two.run(() => cache.match({ title: "two" }))[0].name, "two");
+  assert.throws(() => two.run(() => cache.match({ title: "one" })), /changed after preparation/);
 });
 
 test("platform identity merges only known aliases and returns no credentials or URL data", () => {

@@ -5,6 +5,7 @@ import { HOT_TOPICS } from "@aihot/industry/hot-topics";
 import { sql, closeDb } from "@aihot/backend/db";
 import { buildTopicHotBoard, computeTopicHotRanking, isTopicClarification, safeTopicUrl, type TopicMaterial, type TopicSource } from "@aihot/backend/events/topic-heat";
 import { loadTopicHot, loadTopicHotDetail } from "@aihot/backend/publication/topic-hot";
+import { matchTopicSignals, topicSignalCache } from "@aihot/backend/sources/topic-signals";
 import { SCHEDULES } from "../apps/worker/src/schedules.ts";
 import { buildApp } from "../apps/api/src/app.ts";
 
@@ -101,6 +102,23 @@ test("discussion attention and first-party denial are separate from fact confirm
   assert.deepEqual(new Set(mixed.catalysts.map((c) => c.storyPublicId)), new Set(["denial-story", "different-story"]));
 });
 
+test("prepared inputs serve unchanged board and detail matching without using editorial raw bodies", async () => {
+  const report = material({ id: "prepared-report", title: "虚构产品公告", discussion: false,
+    summary: "光模块供货进展", body: "机器人原始正文不参与公开匹配", tags: [] });
+  const discussion = material({ id: "prepared-discussion", title: "A股讨论", body: "液冷技术",
+    tags: ["机器人"], group: "other-owner" });
+  const rows = [report, discussion];
+  const prepared = await topicSignalCache.prepare(rows.map(m => ({ title: m.title,
+    bodyText: m.discussion ? m.body : m.summary, tags: m.discussion ? [] : m.tags,
+    sourceTags: m.sourceTags, discussion: m.discussion })));
+  const board = prepared.run(() => buildTopicHotBoard(rows, [source], at));
+  assert.deepEqual(new Set(board.entries.map(e => e.topic.slug)),
+    new Set(["finance-optical-communications", "finance-liquid-cooling"]));
+  assert.deepEqual(prepared.run(() => matchTopicSignals({ title: discussion.title,
+    bodyText: discussion.body, sourceTags: discussion.sourceTags, discussion: true })).map(m => m.slug),
+    ["finance-liquid-cooling"], "detail's omitted tags reuse the board's empty tags input");
+});
+
 const sources: string[] = [];
 const ids: string[] = [];
 const rankings: number[] = [];
@@ -110,8 +128,8 @@ after(async () => {
   if (sources.length) await sql`DELETE FROM sources WHERE id=ANY(${sources}::text[])`;
   await closeDb();
 });
-async function dbSource(mode: "editorial" | "hot_signal") {
-  const id = `topic-${mode}-${T}`;
+async function dbSource(mode: "editorial" | "hot_signal", suffix = "") {
+  const id = `topic-${mode}-${T}${suffix}`;
   sources.push(id);
   await sql`INSERT INTO sources(id,name,kind,participation_mode,enabled,created_at) VALUES(${id},${'虚构测试'+mode},'external',${mode},false,${old})`;
   return id;
@@ -169,4 +187,120 @@ test("worker snapshot and publication readers respect release gates, withdrawals
     const [unchanged] = await sql`SELECT (SELECT count(*) FROM receipts) AS receipts,(SELECT count(*) FROM topic_hot_rankings) AS snapshots`;
     assert.deepEqual(unchanged, counts, "page reads do not call models or create rankings");
   } finally { await app.close(); }
+});
+
+async function dbPublication(article: string, sourceId: string, stamp: Date, summary = "虚构公告") {
+  await sql`INSERT INTO publications(article_id,source_id,title,summary,url,discovered_at,timeline_at,sort_at,channel,eligible,selected,visible_after,tags)
+    VALUES(${article},${sourceId},'虚构测试产品公告',${summary},${'https://example.invalid/'+article},${stamp},${stamp},${stamp},'news',true,false,${stamp},${[]})`;
+}
+
+test("reads recheck withdrawals and source isolation after preparation before ETag or detail output", async t => {
+  const stamp = new Date(Date.now() - 1000);
+  const reportSource = await dbSource("editorial", "-withdraw");
+  const signalSource = await dbSource("hot_signal", "-withdraw");
+  const report = await dbItem(reportSource, "withdraw-report", "虚构原始正文", stamp);
+  const signal = await dbItem(signalSource, "withdraw-signal", "A股 #公开撤回样例#", stamp);
+  await dbPublication(report, reportSource, stamp, "液冷产品进展");
+  rankings.push((await computeTopicHotRanking(stamp)).id);
+  const before = await loadTopicHot(stamp);
+  const slug = before.entries.find(e => e.topic.name === "公开撤回样例")!.topic.slug;
+  assert.ok((await loadTopicHotDetail(slug, stamp))!.discussionLinks.some(link => link.url.endsWith(signal)));
+  const app = await buildApp();
+  try {
+    const first = await app.inject({ method: "GET", url: "/api/site/topic-hot" });
+    assert.equal(first.statusCode, 200);
+    const prepare = topicSignalCache.prepare.bind(topicSignalCache);
+    let changed = false;
+    t.mock.method(topicSignalCache, "prepare", async (inputs: Parameters<typeof prepare>[0]) => {
+      const matches = await prepare(inputs);
+      if (!changed) {
+        changed = true;
+        await sql`UPDATE publications SET visibility='withdrawn' WHERE article_id=${report}`;
+        await sql`UPDATE sources SET participation_mode='isolated' WHERE id=${signalSource}`;
+      }
+      return matches;
+    });
+    const response = await app.inject({ method: "GET", url: "/api/site/topic-hot", headers: { "if-none-match": String(first.headers.etag) } });
+    assert.equal(response.statusCode, 200, "withdrawn content cannot validate an old ETag");
+    assert.notEqual(response.headers.etag, first.headers.etag);
+    assert.ok(!response.body.includes(report));
+    assert.ok(!response.body.includes(slug));
+    assert.equal(await loadTopicHotDetail(slug, stamp), null);
+  } finally { await app.close(); }
+});
+
+test("reads reprepare changed public summaries, tags and source roles after yielding", async t => {
+  const stamp = new Date(Date.now() - 1000);
+  const reportSource = await dbSource("editorial", "-revision");
+  const roleSource = await dbSource("hot_signal", "-revision");
+  const report = await dbItem(reportSource, "revision-report", "机器人原始正文", stamp);
+  const role = await dbItem(roleSource, "revision-role", "A股 #角色切换样例#", stamp);
+  await dbPublication(report, reportSource, stamp, "光模块产品进展");
+  await dbPublication(role, roleSource, stamp, "液冷产品进展");
+  rankings.push((await computeTopicHotRanking(stamp)).id);
+  const prepare = topicSignalCache.prepare.bind(topicSignalCache);
+  let rounds = 0;
+  t.mock.method(topicSignalCache, "prepare", async (inputs: Parameters<typeof prepare>[0]) => {
+    const matches = await prepare(inputs);
+    if (++rounds === 1) {
+      await sql`UPDATE publications SET summary='虚构产品进展',tags=${['创新药临床']} WHERE article_id=${report}`;
+      await sql`UPDATE sources SET participation_mode='editorial',tags=${['财经']} WHERE id=${roleSource}`;
+      await sql`UPDATE articles SET title='机器人原始正文已更新',body_text='机器人正文' WHERE id=${report}`;
+    }
+    return matches;
+  });
+  const board = await loadTopicHot(stamp);
+  assert.equal(rounds, 2, "new matching inputs are prepared before synchronous assembly");
+  assert.deepEqual(board.entries.filter(e => e.catalysts.some(c => c.itemId === report)).map(e => e.topic.slug),
+    ["finance-drug-clinical"], "public tags and summary govern editorial matching, not raw article text");
+  assert.deepEqual(board.entries.filter(e => e.catalysts.some(c => c.itemId === role)).map(e => e.topic.slug), ["finance-liquid-cooling"]);
+  assert.ok(!board.entries.some(e => e.topic.name === "角色切换样例"));
+});
+
+test("reads recheck blocked, eligible and newly delayed releases after preparation", async t => {
+  const stamp = new Date(Date.now() - 1000), release = new Date(stamp.getTime() + 60_000);
+  const reportSource = await dbSource("editorial", "-gate");
+  const signalSource = await dbSource("hot_signal", "-gate");
+  const report = await dbItem(reportSource, "gate-report", "虚构原文", stamp);
+  const ineligible = await dbItem(reportSource, "gate-ineligible", "虚构原文", stamp);
+  const signal = await dbItem(signalSource, "gate-signal", "A股 #阻断缓存样例#", stamp);
+  await dbPublication(report, reportSource, stamp, "液冷产品进展");
+  await dbPublication(ineligible, reportSource, stamp, "光模块产品进展");
+  rankings.push((await computeTopicHotRanking(stamp)).id);
+  const prepare = topicSignalCache.prepare.bind(topicSignalCache);
+  let changed = false;
+  t.mock.method(topicSignalCache, "prepare", async (inputs: Parameters<typeof prepare>[0]) => {
+    const matches = await prepare(inputs);
+    if (!changed) {
+      changed = true;
+      await sql`UPDATE articles SET processing_state='blocked' WHERE id=${signal}`;
+      await sql`UPDATE publications SET eligible=false WHERE article_id=${ineligible}`;
+      await sql`UPDATE publications SET selected=true,visible_after=${release} WHERE article_id=${report}`;
+    }
+    return matches;
+  });
+  const before = await loadTopicHot(stamp);
+  assert.ok(!before.entries.some(e => e.topic.name === "阻断缓存样例"));
+  assert.ok(!before.entries.some(e => e.catalysts.some(c => c.itemId === report || c.itemId === ineligible)));
+  assert.ok(before.refreshAt, "saved snapshots retain a freshness deadline");
+  assert.ok(Date.parse(before.refreshAt) <= release.getTime(), "new release gate still caps HTTP freshness");
+  const afterRelease = await loadTopicHot(release);
+  assert.ok(afterRelease.entries.some(e => e.catalysts.some(c => c.itemId === report)));
+  assert.ok(!afterRelease.entries.some(e => e.catalysts.some(c => c.itemId === ineligible)));
+});
+
+test("continually changing matching inputs fail safely after three preparation attempts", async t => {
+  const stamp = new Date(Date.now() - 1000);
+  const signalSource = await dbSource("hot_signal", "-changing");
+  const signal = await dbItem(signalSource, "changing", "A股 #持续变化样例#", stamp);
+  rankings.push((await computeTopicHotRanking(stamp)).id);
+  const prepare = topicSignalCache.prepare.bind(topicSignalCache);
+  let rounds = 0;
+  t.mock.method(topicSignalCache, "prepare", async (inputs: Parameters<typeof prepare>[0]) => {
+    const matches = await prepare(inputs);
+    await sql`UPDATE articles SET title=${`A股 #持续变化样例# ${++rounds}`} WHERE id=${signal}`;
+    return matches;
+  });
+  await assert.rejects(loadTopicHot(stamp), /kept changing during preparation/);
+  assert.equal(rounds, 3);
 });

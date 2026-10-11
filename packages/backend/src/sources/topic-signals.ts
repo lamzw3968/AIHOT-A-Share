@@ -1,5 +1,7 @@
 // Text association only: a topic signal does not verify a fact, a price move or a shared event.
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { setImmediate } from "node:timers/promises";
 import { HOT_TOPICS } from "@aihot/industry/hot-topics";
 
 export interface TopicSignalInput {
@@ -55,7 +57,7 @@ function contains(text: string, term: string): boolean {
 }
 
 /** Deterministic discussion associations; candidates remain unverified and never change story grouping. */
-export function matchTopicSignals(input: TopicSignalInput): TopicSignalMatch[] {
+function computeTopicSignals(input: TopicSignalInput): TopicSignalMatch[] {
   const text = `${cleanText(input.title, TITLE_LIMIT)}\n${cleanText(input.bodyText ?? "", BODY_LIMIT)}`;
   // Source labels give context, not evidence that every article concerns that topic.
   if (input.discussion && DISCUSSION_PROMOTION.test(text)) return [];
@@ -96,6 +98,76 @@ export function matchTopicSignals(input: TopicSignalInput): TopicSignalMatch[] {
     if (candidates.size >= CANDIDATE_LIMIT) break;
   }
   return out;
+}
+
+const MATCH_VERSION = createHash("sha256").update(JSON.stringify([
+  "topic-signals-v1", HOT_TOPICS, TITLE_LIMIT, BODY_LIMIT, TAG_LIMIT, CANDIDATE_LIMIT,
+  MARKET_CONTEXT.source, FINANCE_SOURCE.source, NOISE.source, DISCUSSION_PROMOTION.source, INSTRUCTION.source,
+])).digest("hex");
+const PREPARED_LIMIT = 10_000;
+type Matches = readonly Readonly<TopicSignalMatch>[];
+export interface PreparedTopicSignals {
+  has(input: TopicSignalInput): boolean;
+  run<T>(read: () => T): T;
+}
+
+/** Only text associations are cached. A prepared read owns its results even after LRU eviction. */
+export function createTopicSignalCache(options: {
+  maxEntries?: number; batchSize?: number; version?: () => string;
+  match?: (input: TopicSignalInput) => TopicSignalMatch[];
+} = {}) {
+  const maxEntries = options.maxEntries ?? PREPARED_LIMIT;
+  const batchSize = options.batchSize ?? 32;
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || !Number.isSafeInteger(batchSize) || batchSize < 1) {
+    throw new Error("invalid topic matching cache bounds");
+  }
+  const values = new Map<string, Matches>();
+  const prepared = new AsyncLocalStorage<ReadonlyMap<string, Matches>>();
+  const version = options.version ?? (() => MATCH_VERSION);
+  const compute = options.match ?? computeTopicSignals;
+  const keyOf = (input: TopicSignalInput) => createHash("sha256").update(JSON.stringify([
+    version(), input.title.slice(0, TITLE_LIMIT), (input.bodyText ?? "").slice(0, BODY_LIMIT),
+    (input.tags ?? []).slice(0, TAG_LIMIT).map(tag => tag.slice(0, 96)),
+    (input.sourceTags ?? []).slice(0, TAG_LIMIT).map(tag => tag.slice(0, 96)), !!input.discussion,
+  ])).digest("hex");
+  const get = (key: string, input: TopicSignalInput): Matches => {
+    let result = values.get(key);
+    if (result === undefined) result = Object.freeze(compute(input).map(match => Object.freeze({ ...match })));
+    // Synchronous fill completes before another preheating reader can compute the same key.
+    values.delete(key); values.set(key, result);
+    if (values.size > maxEntries) values.delete(values.keys().next().value!);
+    return result;
+  };
+  return {
+    match(input: TopicSignalInput): TopicSignalMatch[] {
+      const key = keyOf(input);
+      const scope = prepared.getStore();
+      const result = scope ? scope.get(key) : get(key, input);
+      if (result === undefined) throw new Error("topic matching input changed after preparation");
+      return result.map(match => ({ ...match }));
+    },
+    async prepare(inputs: Iterable<TopicSignalInput>): Promise<PreparedTopicSignals> {
+      const matches = new Map<string, Matches>();
+      let count = 0, started = performance.now();
+      for (const input of inputs) {
+        const key = keyOf(input);
+        if (!matches.has(key)) {
+          if (matches.size >= PREPARED_LIMIT) throw new Error("too many topic matching inputs");
+          matches.set(key, get(key, input));
+        }
+        if (++count % batchSize === 0 || performance.now() - started >= 4) {
+          await setImmediate();
+          started = performance.now();
+        }
+      }
+      return { has: input => matches.has(keyOf(input)), run: read => prepared.run(matches, read) };
+    },
+  };
+}
+
+export const topicSignalCache = createTopicSignalCache();
+export function matchTopicSignals(input: TopicSignalInput): TopicSignalMatch[] {
+  return topicSignalCache.match(input);
 }
 
 const PLATFORMS: ReadonlyArray<readonly [string, readonly string[]]> = [
