@@ -117,6 +117,39 @@ export class ModelOutputError extends Error {
   }
 }
 
+/** Resolve GLM compatibility from the actual model, including the deployment's default. */
+function requestParameters(spec: ModelSpec, opts: { maxTokens?: number; temperature?: number; json?: boolean }) {
+  const glm = ["glm-5.3", "glm-5.3-flash", "glm-5.3-flashx"].includes(spec.model.toLowerCase());
+  const configuredExtra = spec.extra;
+  const requestedTokens = Math.max(opts.maxTokens ?? 1500, 512) + (spec.key.endsWith("-think") ? 4000 : 0);
+  // Other models retain their existing parameters, extra handling and receipt identity.
+  if (!glm) return { glm, extra: configuredExtra, maxTokens: requestedTokens, temperature: opts.temperature ?? 0.2 };
+  if (configuredExtra !== undefined && (!configuredExtra || typeof configuredExtra !== "object" || Array.isArray(configuredExtra))) {
+    throw new Error("GLM extra must be a JSON object");
+  }
+  for (const field of ["model", "messages", "stream"]) {
+    if (configuredExtra && field in configuredExtra) throw new Error(`Model extra cannot override ${field}`);
+  }
+  if (configuredExtra && "response_format" in configuredExtra && opts.json !== undefined) {
+    const format = configuredExtra.response_format as { type?: unknown } | null;
+    if (format?.type !== (opts.json ? "json_object" : "text")) throw new Error("Model extra response_format conflicts with the call's json mode");
+  }
+  const extra: Record<string, unknown> = { thinking: { type: "enabled" }, reasoning_effort: "low", ...configuredExtra };
+  const thinking = extra.thinking;
+  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) throw new Error("GLM thinking must be an object");
+  const options = thinking as Record<string, unknown>;
+  if (options.type !== undefined && options.type !== "enabled") throw new Error("GLM-5.3 thinking cannot be disabled");
+  if (!["low", "high", "max"].includes(String(extra.reasoning_effort))) throw new Error("GLM-5.3 reasoning_effort must be low, high or max");
+  extra.thinking = { type: "enabled", ...options };
+  const maxTokens = "max_tokens" in extra ? extra.max_tokens : Math.max(requestedTokens, 4096);
+  const temperature = "temperature" in extra ? extra.temperature : opts.temperature ?? 0.2;
+  if (typeof maxTokens !== "number" || !Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 131_072) {
+    throw new Error("GLM max_tokens must be a positive integer within the model output limit");
+  }
+  if (typeof temperature !== "number" || !Number.isFinite(temperature)) throw new Error("GLM temperature must be finite");
+  return { glm, extra, maxTokens, temperature };
+}
+
 function extractJson(text: string): unknown {
   let t = text.trim();
   const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(t);
@@ -165,8 +198,7 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const apiKey = credential("models", spec.apiKeyEnv);
   if (!baseUrl || !apiKey || !spec.model) throw new Error(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
 
-  const temperature = opts.temperature ?? 0.2;
-  const maxTokens = Math.max(opts.maxTokens ?? 1500, 512) + (spec.key.endsWith("-think") ? 4000 : 0);
+  const { glm, extra, maxTokens, temperature } = requestParameters(spec, opts);
   const userText = typeof opts.user === "string" ? opts.user : JSON.stringify(opts.user);
   const body: Record<string, unknown> = {
     model: spec.model,
@@ -179,7 +211,7 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
     temperature,
     max_tokens: maxTokens,
     ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
-    ...(spec.extra ?? {}),
+    ...(extra ?? {}),
   };
 
   const receipt = await paidRequest(
@@ -188,8 +220,9 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
       model: spec.model,
       purpose: opts.purpose,
       subject: opts.subject,
-      identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: spec.extra ?? null },
-      requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens },
+      identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: extra ?? null },
+      requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens,
+        ...(glm ? { model: spec.model, bodyHash: sha256(JSON.stringify(body)) } : {}) },
       attemptTag: opts.attemptTag,
     },
     async () => {
@@ -232,6 +265,10 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const content = response.choices?.[0]?.message?.content ?? "";
   let parsed: z.infer<S>;
   try {
+    if (glm) {
+      if (response.choices?.[0]?.finish_reason === "length") throw new ModelOutputError("Model output truncated (finish_reason=length)");
+      if (typeof content !== "string" || !content.trim()) throw new ModelOutputError("Model final answer is empty");
+    }
     parsed = opts.schema.parse(opts.parse ? opts.parse(content) : extractJson(content));
   } catch (error) {
     // Unusable output: record it and let a later attempt pay for a fresh answer.
