@@ -5,6 +5,7 @@ import { PgBoss, type SendOptions, type WorkOptions } from "pg-boss";
 import { config } from "../config.ts";
 import { sql, type Db } from "../db.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
+import { ProviderDeferredError, restoreReleasedProviderJob, runProviderAwareJob } from "./provider-deferred.ts";
 export { shutdownSignal } from "../lib/shutdown.ts";
 
 let boss: PgBoss | null = null;
@@ -83,6 +84,7 @@ export async function stopBoss(): Promise<void> {
   if (boss) await boss.stop({ graceful: true, timeout: STOP_TIMEOUT_MS });
   boss = null;
   starting = null;
+  ensured.clear();
 }
 
 export async function ensureQueue(name: string, options: QueueOptions = QUEUE_OPTIONS[name as QueueName] ?? {}): Promise<void> {
@@ -118,7 +120,10 @@ export async function retryReleasedReceiptJobs(): Promise<number> {
         AND EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'receipt.release'
                     AND a.subject = 'receipt:' || (j.output->>'receiptId') AND a.created_at > j.started_on)
       ORDER BY j.completed_on LIMIT 200 FOR UPDATE OF j SKIP LOCKED`;
-    for (const job of jobs) await b.retry(job.name, job.id, { db: queueDb(tx) });
+    for (const job of jobs) {
+      const retried = await b.retry(job.name, job.id, { db: queueDb(tx) });
+      if ("affected" in retried && retried.affected === 1) await restoreReleasedProviderJob(tx, job.id);
+    }
     return jobs.length;
   });
 }
@@ -126,7 +131,8 @@ export async function retryReleasedReceiptJobs(): Promise<number> {
 /** The worker's handler for one queue (jobs/*.ts), called with each job's data. */
 export async function work<Q extends QueueName>(boss: PgBoss, name: Q, options: WorkOptions, handler: (data: JobData[Q]) => Promise<unknown>): Promise<void> {
   await ensureQueue(name);
-  await boss.work<JobData[Q]>(name, options, async ([job]) => (job ? handler(job.data) : undefined));
+  await boss.work<JobData[Q], unknown, WorkOptions & { includeMetadata: true }>(name, { ...options, batchSize: 1, includeMetadata: true }, async ([job]) =>
+    job ? runProviderAwareJob(boss, job, () => handler(job.data)) : undefined);
 }
 
 // Scheduled task bookkeeping: every run leaves a row, so operators see the latest result.
@@ -136,9 +142,15 @@ export async function recordRun<T>(job: string, fn: () => Promise<T>): Promise<T
   try {
     const result = await fn();
     const detail = result && typeof result === "object" ? result : { result };
-    await sql`UPDATE job_runs SET status = 'ok', finished_at = now(), detail = ${sql.json(detail as never)} WHERE id = ${row!.id}`;
+    const deferred = "state" in detail && typeof detail.state === "string" && detail.state.startsWith("provider-deferred");
+    await sql`UPDATE job_runs SET status = ${deferred ? "skipped" : "ok"}, finished_at = now(), detail = ${sql.json(detail as never)} WHERE id = ${row!.id}`;
     return result;
   } catch (error) {
+    if (error instanceof ProviderDeferredError) {
+      await sql`UPDATE job_runs SET status = 'skipped', finished_at = now(), error = NULL,
+        detail = ${sql.json({ state: "provider-deferred", retryAt: error.retryAt.toISOString() })} WHERE id = ${row!.id}`;
+      throw error;
+    }
     await sql`UPDATE job_runs SET status = 'failed', finished_at = now(), error = ${String(error).slice(0, 4000)} WHERE id = ${row!.id}`;
     throw error;
   }

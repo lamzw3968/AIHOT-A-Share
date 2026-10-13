@@ -16,6 +16,7 @@ import { collapseWhitespace } from "../lib/text.ts";
 import { sha256 } from "../lib/ids.ts";
 import { modelFor } from "./models.ts";
 import { shutdownSignal } from "../jobs/queue.ts";
+import { isProviderPause } from "../jobs/provider-deferred.ts";
 import { promptText, promptVersion } from "./prompts.ts";
 
 export const TRANSLATE_PROMPT_VERSION = promptVersion("translate-body", "translate-post");
@@ -261,6 +262,7 @@ export async function translateQuotes(opts: { days?: number; limit?: number; bud
         });
         zh = res.data.t.length === 1 ? res.data.t[0]!.trim() : null;
       } catch (error) {
+        if (isProviderPause(error)) throw error;
         // Switched-off calls or an exhausted budget stop the run; one unusable answer skips its post (its
         // receipt is reused next time, so a retry costs nothing).
         if (/disabled|not configured|budget/i.test((error as Error).message)) throw error;
@@ -310,6 +312,7 @@ export async function translatePending(opts: { limit?: number; budgetMs?: number
       reason = result.reason ?? null;
       revision = result.revision ?? null;
     } catch (error) {
+      if (isProviderPause(error)) throw error;
       // A deploy stops between paid fragments, never aborts a sent request. Received answers stay
       // in receipts and are reused next run; do not mark an interrupted article terminal/partial.
       if (error instanceof TranslationInterruptedError) break;

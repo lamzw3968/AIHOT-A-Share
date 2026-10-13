@@ -12,6 +12,7 @@ import { isHistorical } from "../content/materials.ts";
 import { publishArticle } from "../publication/publish.ts";
 import { BudgetExceededError, ProviderRejectedError, ReceiptBusyError, ReceiptUnknownError } from "../providers/receipts.ts";
 import { ModelOutputError } from "../providers/llm.ts";
+import { ProviderDeferredError } from "../providers/provider-quotas.ts";
 import { enqueue, QUEUES, shutdownSignal, work } from "./queue.ts";
 
 /** Minutes to wait after the n-th failed attempt; one more failure after the last ends in "failed". */
@@ -169,10 +170,10 @@ async function afterFailure(articleId: string, revision: number, error: unknown)
   // failure and must neither consume processing_attempts nor turn an incomplete chain terminal.
   if (error instanceof AnalysisInterruptedError || shutdownSignal.signal.aborted) throw error;
   const message = String(error instanceof Error ? error.message : error).slice(0, 500);
-  if (error instanceof ReceiptBusyError || error instanceof BudgetExceededError) {
+  if (error instanceof ReceiptBusyError || error instanceof BudgetExceededError || error instanceof ProviderDeferredError) {
     // Not the article's fault: the same request is in flight, or the budget window is full.
-    const seconds = error instanceof BudgetExceededError ? error.retryAfterSeconds : 60;
-    const retryAt = new Date(Date.now() + seconds * 1000);
+    const seconds = error instanceof BudgetExceededError || error instanceof ProviderDeferredError ? error.retryAfterSeconds : 60;
+    const retryAt = error instanceof ProviderDeferredError ? error.retryAt : new Date(Date.now() + seconds * 1000);
     await sql`UPDATE articles SET processing_state = 'new', processing_error = ${message}, processing_retry_at = ${retryAt}, processing_queued_at = NULL
               WHERE id = ${articleId} AND revision = ${revision}`;
     return { state: "waiting", retryAt };
@@ -187,7 +188,8 @@ async function afterFailure(articleId: string, revision: number, error: unknown)
                 processing_retry_at = NULL, processing_queued_at = NULL WHERE id = ${articleId} AND revision = ${revision}`;
     return { state: "failed" };
   }
-  const retryAt = new Date(Date.now() + RETRY_MINUTES[attempts - 1]! * 60_000);
+  const cooldown = error instanceof ProviderRejectedError && error.status === 429 ? (error.retryAfterSeconds ?? 0) * 1000 : 0;
+  const retryAt = new Date(Date.now() + Math.max(RETRY_MINUTES[attempts - 1]! * 60_000, cooldown));
   await sql`UPDATE articles SET processing_state = 'new', processing_error = ${message}, processing_attempts = ${attempts},
               processing_retry_at = ${retryAt}, processing_queued_at = NULL WHERE id = ${articleId} AND revision = ${revision}`;
   return { state: "retrying", retryAt };

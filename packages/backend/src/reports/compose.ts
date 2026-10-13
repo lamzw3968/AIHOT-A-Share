@@ -12,6 +12,7 @@ import { Conflict } from "../audit.ts";
 import { chatJson, ModelOutputError } from "../providers/llm.ts";
 import { completeReceipt, rejectReceivedResponse } from "../providers/receipts.ts";
 import { shutdownSignal } from "../jobs/queue.ts";
+import { isProviderPause } from "../jobs/provider-deferred.ts";
 
 export const REPORT_VERSION = promptVersion("report-daily-lead", "report-period");
 
@@ -337,6 +338,7 @@ export async function catchUpReports(now = new Date(), limit = 8): Promise<{ gen
         await k.compose(key, "catch-up");
         generated.push(`${k.kind}:${key}`);
       } catch (error) {
+        if (isProviderPause(error)) throw error;
         failed.push(`${k.kind}:${key}`);
         console.error(JSON.stringify({ level: "error", msg: "report catch-up failed", report: `${k.kind}:${key}`, error: String(error).slice(0, 300) }));
       }
