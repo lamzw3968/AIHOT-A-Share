@@ -9,6 +9,8 @@
 import { sql, type Db } from "../db.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import { claimProviderQuota, coolDownProviderQuota, finishProviderQuota, ProviderDeferredError, type ProviderQuota } from "./provider-quotas.ts";
 
 export class BudgetExceededError extends Error {
   readonly service: string;
@@ -34,10 +36,12 @@ export class ReceiptUnknownError extends Error {
 export class ProviderRejectedError extends Error {
   readonly status: number | null;
   readonly retryable: boolean;
-  constructor(message: string, status: number | null, retryable: boolean) {
+  retryAfterSeconds?: number;
+  constructor(message: string, status: number | null, retryable: boolean, retryAfterSeconds?: number) {
     super(message);
     this.status = status;
     this.retryable = retryable;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -59,6 +63,8 @@ export interface ReceiptRequest {
   requestSummary?: Record<string, unknown>;
   /** Distinguishes an explicit re-run (e.g. admin "re-evaluate") from recovery of the same request. */
   attemptTag?: string;
+  /** Admission policy, deliberately outside logical identity and stored request summaries. */
+  quota?: ProviderQuota;
 }
 
 export interface ReceiptResult {
@@ -110,7 +116,7 @@ async function checkBudget(tx: Db, service: string): Promise<void> {
 export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallOutcome>): Promise<ReceiptResult> {
   const logicalKey = logicalKeyFor(req);
 
-  const claimed = await sql.begin(async (tx) => {
+  const claim = () => sql.begin(async (tx) => {
     // Serialise budget checks per service so concurrent workers cannot overshoot.
     await tx`SELECT pg_advisory_xact_lock(hashtext(${"budget:" + req.service}))`;
     const [existing] = await tx<ReceiptRow[]>`
@@ -128,20 +134,37 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       if (existing.status === "unknown") return { kind: "unknown" as const, row: existing };
       // failed: the provider did not take the request, or its answer was unusable; a new attempt is allowed.
       await checkBudget(tx, req.service);
+      const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
       const [r] = await tx<{ attempts: number }[]>`
         UPDATE receipts SET status = 'pending', attempts = attempts + 1, error = NULL, updated_at = now() WHERE id = ${existing.id} RETURNING attempts`;
       const attemptId = await startAttempt(tx, existing.id, r!.attempts, req);
-      return { kind: "call" as const, id: existing.id, attemptId };
+      return { kind: "call" as const, id: existing.id, attemptId, leaseId };
     }
     await checkBudget(tx, req.service);
+    const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
     const [row] = await tx<{ id: number }[]>`
       INSERT INTO receipts (logical_key, service, model, purpose, subject, status, request, attempts)
       VALUES (${logicalKey}, ${req.service}, ${req.model ?? null}, ${req.purpose}, ${req.subject ?? null}, 'pending',
               ${tx.json((req.requestSummary ?? {}) as never)}, 1)
       RETURNING id`;
     const attemptId = await startAttempt(tx, row!.id, 1, req);
-    return { kind: "call" as const, id: row!.id, attemptId };
+    return { kind: "call" as const, id: row!.id, attemptId, leaseId };
   });
+
+  // Retry only unsent admission, outside any transaction/connection. A short interval between
+  // consecutive steps need not defer the entire task. The HTTP callback is still invoked once;
+  // longer cooldowns/contention are reported to the caller for later recovery.
+  const waitDeadline = Date.now() + 2100;
+  let claimed: Awaited<ReturnType<typeof claim>>;
+  for (let waits = 0; ; waits++) {
+    try { claimed = await claim(); break; }
+    catch (error) {
+      if (!(error instanceof ProviderDeferredError)) throw error;
+      const waitMs = Math.max(1, error.retryAt.getTime() - Date.now());
+      if (waits >= 2 || waitMs > 1100 || Date.now() + waitMs > waitDeadline) throw error;
+      await delay(waitMs, undefined, { signal: shutdownSignal.signal });
+    }
+  }
 
   if (claimed.kind === "reuse") return { receiptId: claimed.row.id, response: claimed.row.response, reused: true };
   if (claimed.kind === "busy") throw new ReceiptBusyError(`Receipt ${claimed.row.id} is in flight`);
@@ -149,7 +172,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
     throw new ReceiptUnknownError(claimed.row.id, `Receipt ${claimed.row.id} has an unknown outcome; it is released once automatically, then from the admin`);
   }
 
-  const { id: receiptId, attemptId } = claimed;
+  const { id: receiptId, attemptId, leaseId } = claimed;
   const started = Date.now();
   let outcome: CallOutcome;
   try {
@@ -159,6 +182,10 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
     // "unknown": the request may have reached the provider (timeout, reset): do not re-send automatically.
     const message = (error instanceof ProviderRejectedError ? error.message : String(error)).slice(0, 2000);
     await sql.begin(async (tx) => {
+      if (req.quota && leaseId && error instanceof ProviderRejectedError) {
+        if (error.status === 429) error.retryAfterSeconds = await coolDownProviderQuota(tx, req.quota, error.retryAfterSeconds);
+        await finishProviderQuota(tx, req.quota, leaseId, false);
+      }
       await tx`UPDATE receipts SET status = ${status}, error = ${message}, updated_at = now() WHERE id = ${receiptId}`;
       await tx`UPDATE receipt_attempts SET status = ${status}, error = ${message}, latency_ms = ${Date.now() - started}, finished_at = now() WHERE id = ${attemptId}`;
     });
@@ -166,6 +193,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
   }
 
   await sql.begin(async (tx) => {
+    if (req.quota && leaseId) await finishProviderQuota(tx, req.quota, leaseId, true);
     await tx`
       UPDATE receipts SET
         status = 'received',

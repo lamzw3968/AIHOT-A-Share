@@ -21,9 +21,9 @@ process.env.LOG_LEVEL ??= "error";
 // Model tests exercise the real receipt path against local stubs only. Remove inherited credentials
 // before modules load, and refuse real network connections even when a test enables a provider.
 for (const name of Object.keys(process.env)) {
-  if (name.endsWith("_API_KEY") || ["DAJIALA_KEY", "FEISHU_APP_SECRET", "INGEST_TOKEN", "LLM_EXTRA_JSON", "EGRESS_PROXY_URL"].includes(name)) delete process.env[name];
+  if (name.endsWith("_API_KEY") || name.startsWith("ANT_LING_") || ["DAJIALA_KEY", "FEISHU_APP_SECRET", "INGEST_TOKEN", "LLM_EXTRA_JSON", "LLM_PROVIDER", "EGRESS_PROXY_URL"].includes(name)) delete process.env[name];
 }
-for (const name of ["LLM", "ZHIPU", "DEEPSEEK", "DASHSCOPE", "XIAOMI_MIMO", "EMBEDDING", "JINA", "SOCIALDATA", "DAJIALA"]) {
+for (const name of ["LLM", "ANT_LING", "ZHIPU", "DEEPSEEK", "DASHSCOPE", "XIAOMI_MIMO", "EMBEDDING", "JINA", "SOCIALDATA", "DAJIALA"]) {
   process.env[`${name}_BASE_URL`] = "http://127.0.0.1:9/v1";
 }
 process.env.MODEL_CALLS_ENABLED = "true";

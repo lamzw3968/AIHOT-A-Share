@@ -65,6 +65,8 @@ test("public routes read content only through the public read layer", () => {
 const OWNERS: Record<string, string> = {
   publications: "publication/", selected_ledger: "publication/", selected_state: "publication/", pool_search: "publication/",
   receipts: "providers/receipts.ts", receipt_attempts: "providers/receipts.ts",
+  provider_quotas: "providers/provider-quotas.ts", provider_quota_leases: "providers/provider-quotas.ts",
+  provider_deferred_jobs: "jobs/provider-deferred.ts", // Reserved owner; scheduling is migrated separately.
   deliveries: "notify/",
   facts: "events/", fact_articles: "events/", stories: "events/", story_signals: "events/", story_aliases: "events/", story_links: "events/",
   story_digests: "events/", grouping_decisions: "events/", grouping_overrides: "events/", regroup_pending: "events/",
