@@ -6,6 +6,8 @@ import { config, credential } from "../config.ts";
 import { sha256 } from "../lib/ids.ts";
 import { completeReceipt, paidRequest, ProviderRejectedError, rejectReceivedResponse } from "./receipts.ts";
 import { sql } from "../db.ts";
+import { assertLingConfiguration, isLingModel, LING_MODEL, lingChatEndpoint, lingDefaultMatches, lingProfile, lingQuota } from "./model-profile.ts";
+import { retryAfterSeconds } from "./provider-quotas.ts";
 
 export interface ModelSpec {
   key: string;
@@ -19,13 +21,18 @@ export interface ModelSpec {
   vision?: boolean;
 }
 
-function extraFromEnv(value: string | undefined): Record<string, unknown> | undefined {
+function extraFromEnv(value: string | undefined, name = "LLM_EXTRA_JSON"): Record<string, unknown> | undefined {
   if (!value) return undefined;
   try {
     return JSON.parse(value) as Record<string, unknown>;
   } catch {
-    throw new Error("LLM_EXTRA_JSON must be a JSON object, e.g. {\"enable_thinking\": false}");
+    throw new Error(`${name} must be a JSON object, e.g. {"enable_thinking": false}`);
   }
+}
+
+function reuseLingDefault(): boolean {
+  return !credential("models", "ANT_LING_BASE_URL") && !credential("models", "ANT_LING_API_KEY") &&
+    lingDefaultMatches(credential("models", "LLM_BASE_URL"), process.env.LLM_MODEL);
 }
 
 export const MODELS: Record<string, ModelSpec> = {
@@ -36,6 +43,16 @@ export const MODELS: Record<string, ModelSpec> = {
     get extra() { return extraFromEnv(process.env.LLM_EXTRA_JSON); },
     get jsonMode() { return process.env.LLM_JSON_MODE !== "false"; },
     get vision() { return process.env.LLM_VISION === "true"; },
+  },
+  "ling-3.1-flash": {
+    key: "ling-3.1-flash", service: "llm", model: LING_MODEL,
+    baseUrlEnv: "ANT_LING_BASE_URL", apiKeyEnv: "ANT_LING_API_KEY",
+    get extra() {
+      if (process.env.ANT_LING_EXTRA_JSON) return extraFromEnv(process.env.ANT_LING_EXTRA_JSON, "ANT_LING_EXTRA_JSON");
+      return reuseLingDefault() ? extraFromEnv(process.env.LLM_EXTRA_JSON) : undefined;
+    },
+    get jsonMode() { return reuseLingDefault() ? process.env.LLM_JSON_MODE !== "false" : true; },
+    vision: false,
   },
   // Named presets (the models AIHOT itself runs on); each needs its own key.
   // GLM 5.3 Flash always reasons; the lowest effort keeps short structured tasks fast.
@@ -111,10 +128,23 @@ export interface ChatJsonResult<T> {
 
 export class ModelOutputError extends Error {
   readonly receiptId: number | null;
-  constructor(message: string, receiptId: number | null = null) {
+  readonly reason: "length" | "empty" | "json" | "schema" | null;
+  constructor(message: string, receiptId: number | null = null, reason: ModelOutputError["reason"] = null) {
     super(message);
     this.receiptId = receiptId;
+    this.reason = reason;
   }
+}
+
+function modelCredentials(spec: ModelSpec): { baseUrl: string | null; apiKey: string | null } {
+  const baseUrl = credential("models", spec.baseUrlEnv);
+  const apiKey = credential("models", spec.apiKeyEnv);
+  // A half-configured independent model must never borrow another provider's credential.
+  if (spec.key !== "ling-3.1-flash" || baseUrl || apiKey) return { baseUrl, apiKey };
+  const fallback = credential("models", "LLM_BASE_URL");
+  return lingDefaultMatches(fallback, process.env.LLM_MODEL)
+    ? { baseUrl: fallback, apiKey: credential("models", "LLM_API_KEY") }
+    : { baseUrl: null, apiKey: null };
 }
 
 /** Resolve GLM compatibility from the actual model, including the deployment's default. */
@@ -194,14 +224,20 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
   if (!config.modelCallsEnabled) throw new Error("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
-  const baseUrl = credential("models", spec.baseUrlEnv);
-  const apiKey = credential("models", spec.apiKeyEnv);
+  const { baseUrl, apiKey } = modelCredentials(spec);
   if (!baseUrl || !apiKey || !spec.model) throw new Error(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
 
-  const { glm, extra, maxTokens, temperature } = requestParameters(spec, opts);
+  assertLingConfiguration(spec.model, baseUrl);
+  const ling = isLingModel(spec.model);
+  const model = ling ? LING_MODEL : spec.model;
+  const { glm, extra, maxTokens, temperature, timeoutMs } = ling
+    ? { glm: false, ...lingProfile(spec, opts) }
+    : { ...requestParameters(spec, opts), timeoutMs: opts.timeoutMs ?? 120_000 };
+  const endpoint = ling ? lingChatEndpoint(baseUrl) : `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const quota = ling ? lingQuota(endpoint, apiKey, timeoutMs) : undefined;
   const userText = typeof opts.user === "string" ? opts.user : JSON.stringify(opts.user);
   const body: Record<string, unknown> = {
-    model: spec.model,
+    model,
     messages: [
       // A prompt given as one user message (the title/summary prompts) has no system message.
       ...(opts.system ? [{ role: "system", content: opts.system }] : []),
@@ -217,23 +253,25 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const receipt = await paidRequest(
     {
       service: spec.service,
-      model: spec.model,
+      model,
       purpose: opts.purpose,
       subject: opts.subject,
-      identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: extra ?? null },
+      identity: { model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: extra ?? null,
+        ...(ling ? { bodyHash: sha256(JSON.stringify(body)) } : {}) },
       requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens,
-        ...(glm ? { model: spec.model, bodyHash: sha256(JSON.stringify(body)) } : {}) },
+        ...(glm || ling ? { model, bodyHash: sha256(JSON.stringify(body)) } : {}) },
       attemptTag: opts.attemptTag,
+      quota,
     },
     async () => {
       const started = Date.now();
       let res: Response;
       try {
-        res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        res = await fetch(endpoint, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
+          signal: AbortSignal.timeout(timeoutMs),
         });
       } catch (error) {
         if (isConnectFailure(error)) throw new ProviderRejectedError(`connect failed: ${String(error)}`, null, true);
@@ -242,7 +280,8 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
       const text = await res.text();
       if (!res.ok) {
         const retryable = res.status === 429 || res.status >= 500;
-        throw new ProviderRejectedError(`HTTP ${res.status}: ${text.slice(0, 500)}`, res.status, retryable);
+        throw new ProviderRejectedError(`HTTP ${res.status}: ${text.slice(0, 500)}`, res.status, retryable,
+          ling && res.status === 429 ? retryAfterSeconds(res.headers.get("retry-after")) : undefined);
       }
       let json: Record<string, unknown>;
       try {
@@ -264,16 +303,21 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const response = receipt.response as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }>; usage?: Record<string, unknown> };
   const content = response.choices?.[0]?.message?.content ?? "";
   let parsed: z.infer<S>;
+  let reason: ModelOutputError["reason"] = ling ? "length" : null;
   try {
-    if (glm) {
+    if (glm || ling) {
       if (response.choices?.[0]?.finish_reason === "length") throw new ModelOutputError("Model output truncated (finish_reason=length)");
+      if (ling) reason = "empty";
       if (typeof content !== "string" || !content.trim()) throw new ModelOutputError("Model final answer is empty");
     }
-    parsed = opts.schema.parse(opts.parse ? opts.parse(content) : extractJson(content));
+    if (ling) reason = "json";
+    const input = opts.parse ? opts.parse(content) : extractJson(content);
+    if (ling) reason = "schema";
+    parsed = opts.schema.parse(input);
   } catch (error) {
     // Unusable output: record it and let a later attempt pay for a fresh answer.
     await rejectReceivedResponse(receipt.receiptId, `unusable output: ${String(error).slice(0, 500)}`);
-    throw new ModelOutputError(`Model ${opts.model} returned unusable output for ${opts.subject}: ${String(error).slice(0, 300)}`, receipt.receiptId);
+    throw new ModelOutputError(`Model ${opts.model} returned unusable output for ${opts.subject}: ${String(error).slice(0, 300)}`, receipt.receiptId, reason);
   }
   return { data: parsed, receiptId: receipt.receiptId, reused: receipt.reused, model: spec.key, usage: response.usage ?? null };
 }
