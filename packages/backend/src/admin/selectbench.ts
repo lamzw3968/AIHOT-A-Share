@@ -26,16 +26,92 @@ interface ModelReport {
   cases?: CaseIn[];
 }
 
+function invalidReport(detail: string): never {
+  throw Object.assign(new Error(`SelectBench report is incomplete or invalid: ${detail}`), { statusCode: 400 });
+}
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+const count = (value: unknown, field: string): number => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) invalidReport(`${field} must be a non-negative integer`);
+  return value as number;
+};
+
+function rejectInterruption(value: Record<string, unknown>) {
+  for (const field of ["incomplete", "deferred", "unstarted"]) {
+    if (value[field] !== undefined && value[field] !== null && value[field] !== false && value[field] !== 0) invalidReport(`contains ${field}`);
+  }
+  if (value.pause !== undefined && value.pause !== null) invalidReport("contains a pause");
+}
+
+/** Validate before any DB/audit write. Absent cases remain supported for historical summary-only
+ * reports; an explicitly supplied case list must cover the whole sample for every model. */
+function completeReport(report: unknown) {
+  if (!isRecord(report)) invalidReport("expected an object");
+  const r = report as Record<string, unknown>;
+  rejectInterruption(r);
+  if (r.meta !== undefined && !isRecord(r.meta)) invalidReport("invalid metadata");
+  const meta = (r.meta ?? {}) as Record<string, unknown>;
+  rejectInterruption(meta);
+  const rawModels = r.models ?? Object.fromEntries(Object.entries(r).filter(([key]) => key !== "meta"));
+  if (!isRecord(rawModels) || !Object.keys(rawModels).length) invalidReport("no model summaries");
+  const models = rawModels as Record<string, ModelReport>;
+  const names = Object.keys(models);
+  for (const field of ["requestedModels", "completedModels", "unstartedModels"]) {
+    const value = meta[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value) || value.some((name) => typeof name !== "string" || !name.trim()) || new Set(value).size !== value.length) invalidReport(`invalid ${field}`);
+    const expected = field === "unstartedModels" ? [] : names;
+    if (JSON.stringify([...value].sort()) !== JSON.stringify([...expected].sort())) invalidReport(`${field} does not match model coverage`);
+  }
+  let sampleSize: number | undefined = meta.n === undefined ? undefined : count(meta.n, "meta.n");
+  let caseIds: string[] | undefined;
+  for (const name of names) {
+    const model = models[name];
+    if (!name.trim() || !isRecord(model) || !isRecord(model.summary)) invalidReport("missing model summary");
+    const summary = model!.summary;
+    rejectInterruption(model as unknown as Record<string, unknown>);
+    rejectInterruption(summary);
+    for (const field of ["accuracy", "precision", "recall", "f1", "selectedRate", "goldSelectRate"]) {
+      if (summary[field] !== undefined && (typeof summary[field] !== "number" || !Number.isFinite(summary[field]) || (summary[field] as number) < 0 || (summary[field] as number) > 1)) invalidReport(`invalid ${field}`);
+    }
+    const n = summary.n === undefined ? sampleSize : count(summary.n, "summary.n");
+    if (n === undefined || n === 0 || (sampleSize !== undefined && sampleSize !== n)) invalidReport("model sample sizes do not match");
+    sampleSize = n;
+    for (const field of ["decisive", "either", "errors"]) if (summary[field] !== undefined) count(summary[field], field);
+    if (["decisive", "either", "errors"].every((field) => summary[field] !== undefined)
+      && Number(summary.decisive) + Number(summary.either) + Number(summary.errors) !== n) invalidReport("summary does not cover the sample");
+    if (model!.cases !== undefined) {
+      if (!Array.isArray(model!.cases) || model!.cases.length !== n) invalidReport("case list does not cover the sample");
+      let errors = 0, either = 0;
+      const ids: string[] = [];
+      for (const item of model!.cases) {
+        if (!isRecord(item)) invalidReport("invalid case");
+        rejectInterruption(item as unknown as Record<string, unknown>);
+        if (typeof item.caseId !== "string" || !item.caseId.trim() || typeof item.title !== "string"
+          || !["select", "reject", "either"].includes(item.gold)) invalidReport("invalid case identity or gold label");
+        ids.push(item.caseId);
+        if (item.decision === null) {
+          // A completed attempt with a bad output is still a historical quality error, not a pause.
+          if (typeof item.error !== "string" || !item.error.trim()) invalidReport("case has no completed decision or error");
+          errors++;
+        } else if (!["select", "reject"].includes(item.decision)) invalidReport("invalid case decision");
+        else if (item.gold === "either") either++;
+      }
+      ids.sort();
+      if (new Set(ids).size !== ids.length || (caseIds && JSON.stringify(caseIds) !== JSON.stringify(ids))) invalidReport("case coverage differs across models");
+      caseIds = ids;
+      for (const [field, actual] of [["errors", errors], ["either", either], ["decisive", n - errors - either]] as const) {
+        if (summary[field] !== undefined && summary[field] !== actual) invalidReport(`${field} does not match completed cases`);
+      }
+    }
+  }
+  return { meta, models, names, sampleSize: sampleSize! };
+}
+
 /** Accepts { meta, models } or the older report shape keyed by model name. */
 export async function importSelectBenchRun(report: unknown, label: string, actor: string) {
-  const r = report as { meta?: Record<string, unknown>; models?: Record<string, ModelReport> } & Record<string, ModelReport>;
-  const models = (r.models ?? Object.fromEntries(Object.entries(r).filter(([k]) => k !== "meta"))) as Record<string, ModelReport>;
-  const names = Object.keys(models).filter((m) => models[m]?.summary);
-  if (!names.length) throw new Error("report has no model summaries");
-  const meta = r.meta ?? {};
+  const { meta, models, names, sampleSize } = completeReport(report);
   const id = `sb-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${randomBytes(3).toString("hex")}`;
   const summary = Object.fromEntries(names.map((m) => [m, { ...models[m]!.summary, sweep: models[m]!.sweep ?? [] }]));
-  const sampleSize = Number(meta.n ?? (models[names[0]!]!.summary as { n?: number }).n ?? 0);
   await sql.begin(async (tx) => {
     await tx`
       INSERT INTO selectbench_runs (id, label, split, sample_size, seed, prompt_version, models, summary, imported_by)
