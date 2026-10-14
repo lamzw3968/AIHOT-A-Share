@@ -61,7 +61,7 @@ test("waiting does not create a receipt/attempt, and a cached result bypasses qu
 test("unknown calls retain capacity until lease expiry without releasing their logical receipt", async () => {
   const q = quota("unknown");
   const req = request("unknown", q);
-  await assert.rejects(paidRequest(req, () => Promise.reject(new Error("unknown network outcome"))), /unknown network/);
+  await assert.rejects(paidRequest(req, () => Promise.reject(new Error("unknown network outcome"))), ReceiptUnknownError);
   await assert.rejects(paidRequest(req, answer), ReceiptUnknownError);
   await assert.rejects(paidRequest(request("other-during-unknown", q), answer), ProviderDeferredError);
   const [lease] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM provider_quota_leases WHERE quota_key = ${q.key}`;
@@ -243,16 +243,16 @@ test("invalid policies and reservation failures roll back quota and receipt admi
   assert.deepEqual(state, { quotas: 0, receipts: 0 });
 });
 
-test("a response-save failure retains a pending receipt and its lease without another send", async () => {
+test("a response-save failure identifies the unknown receipt and retains its lease without another send", async () => {
   const q = quota("save-failure");
   const req = request("save-failure", q);
   let sent = 0;
-  await assert.rejects(paidRequest(req, async () => { sent++; return { response: { invalidJson: 1n } }; }), /BigInt/i);
+  await assert.rejects(paidRequest(req, async () => { sent++; return { response: { invalidJson: 1n } }; }), ReceiptUnknownError);
   const [row] = await sql`SELECT r.status, r.response, a.status AS attempt_status,
     (SELECT count(*)::int FROM provider_quota_leases WHERE quota_key = ${q.key}) AS leases
     FROM receipts r JOIN receipt_attempts a ON a.receipt_id = r.id WHERE r.subject = ${req.subject}`;
-  assert.deepEqual(row, { status: "pending", response: null, attempt_status: "pending", leases: 1 });
-  await assert.rejects(paidRequest(req, async () => { sent++; return answer(); }), ReceiptBusyError);
+  assert.deepEqual(row, { status: "unknown", response: null, attempt_status: "unknown", leases: 1 });
+  await assert.rejects(paidRequest(req, async () => { sent++; return answer(); }), ReceiptUnknownError);
   await sql`UPDATE receipts SET updated_at = now() - interval '11 minutes' WHERE subject = ${req.subject}`;
   await assert.rejects(paidRequest(req, answer), ReceiptUnknownError);
   await sql`UPDATE provider_quota_leases SET expires_at = now() - interval '1 second' WHERE quota_key = ${q.key}`;

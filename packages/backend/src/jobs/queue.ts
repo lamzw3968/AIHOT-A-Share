@@ -116,9 +116,13 @@ export async function retryReleasedReceiptJobs(): Promise<number> {
   return sql.begin(async (tx) => {
     const jobs = await tx<{ id: string; name: string }[]>`
       SELECT j.id, j.name FROM pgboss.job j
-      WHERE j.state = 'failed'
+      WHERE j.state = 'failed' AND j.keep_until > clock_timestamp()
         AND EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'receipt.release'
-                    AND a.subject = 'receipt:' || (j.output->>'receiptId') AND a.created_at > j.started_on)
+                    AND a.subject = 'receipt:' || (j.output->>'receiptId') AND a.created_at > j.started_on
+                    AND a.actor <> 'ops.recover' AND jsonb_typeof(a.after->'billed') = 'boolean'
+                    AND a.before->>'status' = 'unknown' AND a.after->>'status' = 'failed'
+                    AND NOT EXISTS (SELECT 1 FROM provider_deferred_jobs d WHERE d.current_job_id = j.id
+                                    AND (d.expires_at <= clock_timestamp() OR d.status = 'expired')))
       ORDER BY j.completed_on LIMIT 200 FOR UPDATE OF j SKIP LOCKED`;
     for (const job of jobs) {
       const retried = await b.retry(job.name, job.id, { db: queueDb(tx) });

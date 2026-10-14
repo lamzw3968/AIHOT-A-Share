@@ -234,7 +234,7 @@ test("a connection lost after sending remains unknown and stops evaluation witho
   const score = await stub(() => scored);
   t.after(async () => { await score.close(); await new Promise<void>((resolve) => provider.close(() => resolve())); });
   const result = await evaluate({ prefilter: endpoint, score: score.url });
-  await assertIncomplete(result, "evaluation-error");
+  await assertIncomplete(result, "receipt-unknown");
   assert.equal(hits, 1); assert.equal(score.hits(), 0);
   const rows = await sql`SELECT r.status,a.status AS attempt FROM receipts r JOIN receipt_attempts a ON a.receipt_id=r.id
     WHERE r.subject LIKE ${`article:gold-${result.marker}%`}`;

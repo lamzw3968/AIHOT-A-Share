@@ -399,7 +399,13 @@ test("unknown after an actual HTTP send stays protected even after its quota lea
   const fetch = globalThis.fetch;
   const hits = seen.length;
   globalThis.fetch = async (url, init) => { await fetch(url, init); throw new Error("mock lost response after send"); };
-  try { await assert.rejects(ask(subject), /lost response/); } finally { globalThis.fetch = fetch; }
+  let receiptId = 0;
+  try { await assert.rejects(ask(subject), (error) => {
+    assert.ok(error instanceof ReceiptUnknownError);
+    receiptId = error.receiptId;
+    assert.ok(!String(error).includes("mock lost response"), "raw provider error is not exposed");
+    return true;
+  }); } finally { globalThis.fetch = fetch; }
   assert.equal(seen.length, hits + 1);
   await assert.rejects(ask(subject), ReceiptUnknownError);
   const quota = lingQuota(endpoint, process.env.LLM_API_KEY!, 85_000);
@@ -409,6 +415,7 @@ test("unknown after an actual HTTP send stays protected even after its quota lea
   assert.equal(seen.length, hits + 1);
   const [row] = await sql`SELECT r.status, a.status AS attempt FROM receipts r JOIN receipt_attempts a ON a.receipt_id=r.id WHERE r.subject=${subject}`;
   assert.deepEqual(row, { status: "unknown", attempt: "unknown" });
+  assert.equal((await sql`SELECT id FROM receipts WHERE subject=${subject}`)[0]!.id, receiptId);
 });
 
 test("real double scoring respects shared QPS with two distinct receipts and no business deferral", async () => {

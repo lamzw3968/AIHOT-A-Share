@@ -155,7 +155,7 @@ async function processRevision(articleId: string, row: NonNullable<Awaited<Retur
   } catch (error) {
     if (error instanceof AnalysisInterruptedError || shutdownSignal.signal.aborted) throw error;
     if (error instanceof ReceiptUnknownError) {
-      // The provider may have billed this request: stop; ops.recover releases it once and requeues the article.
+      // The provider may have billed this request: stop until an audited admin release requeues it.
       await sql`UPDATE articles SET processing_state = 'failed', processing_error = ${`receipt ${error.receiptId} outcome unknown`}
                 WHERE id = ${articleId} AND revision = ${row.revision}`;
       return { state: "unknown-receipt" };

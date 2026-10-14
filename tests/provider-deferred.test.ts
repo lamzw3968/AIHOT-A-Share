@@ -399,10 +399,16 @@ test("unknown paid requests are not resent, while the existing audited release c
   const request = { service: `deferred-test-${tag()}`, purpose: "deferred_unknown", subject: `deferred:${id}`, identity: id, attemptTag: `same-${id}` };
   let calls = 0;
   const call = () => paidRequest(request, async () => { calls++; throw new Error("connection lost after send"); });
-  await assert.rejects(runProviderAwareJob(boss, continued, call), /connection lost/);
+  let unknown: ReceiptUnknownError | undefined;
+  await assert.rejects(runProviderAwareJob(boss, continued, call), (error) => {
+    assert.ok(error instanceof ReceiptUnknownError);
+    unknown = error;
+    return true;
+  });
   const [receipt] = await sql<{ id: number }[]>`SELECT id FROM receipts WHERE subject = ${request.subject}`;
   assert.ok(receipt);
-  await boss.fail(queue, continued.id, { receiptId: receipt.id });
+  assert.equal(unknown!.receiptId, receipt.id);
+  await boss.fail(queue, continued.id, unknown);
   assert.equal((await row(id))?.status, "finished");
   await assert.rejects(call(), ReceiptUnknownError);
   assert.equal(calls, 1);
@@ -416,5 +422,26 @@ test("unknown paid requests are not resent, while the existing audited release c
   await runProviderAwareJob(boss, released, () => paidRequest(request, async () => { calls++; return { response: { ok: true } }; }));
   await boss.complete(queue, released.id);
   assert.equal(calls, 2, "only the explicit audited release permits the second paid attempt");
+  assert.equal((await row(id))?.status, "finished");
+});
+
+test("manual receipt authorization does not revive a continuation beyond its original deadline", async () => {
+  const { boss, queue, id, job } = await fixture(0);
+  await runProviderAwareJob(boss, job, async () => { throw new ProviderDeferredError(new Date()); });
+  await resumeDeferredProviderJobs(boss);
+  const [continued] = await boss.fetch(queue, { includeMetadata: true });
+  assert.ok(continued);
+  const request = { service: `deferred-expired-${tag()}`, purpose: "deferred_unknown", identity: id };
+  let unknown: ReceiptUnknownError | undefined;
+  await assert.rejects(runProviderAwareJob(boss, continued, () => paidRequest(request, async () => { throw new Error("lost response"); })), (error) => {
+    assert.ok(error instanceof ReceiptUnknownError);
+    unknown = error;
+    return true;
+  });
+  await boss.fail(queue, continued.id, unknown);
+  await releaseReceipt(unknown!.receiptId, { billed: false, note: "mock checked; authorize a send within the original deadline" }, "test");
+  await sql`UPDATE provider_deferred_jobs SET expires_at = now() - interval '1 second' WHERE id = ${id}`;
+  await retryReleasedReceiptJobs();
+  assert.equal((await boss.getJobById(queue, continued.id))?.state, "failed");
   assert.equal((await row(id))?.status, "finished");
 });

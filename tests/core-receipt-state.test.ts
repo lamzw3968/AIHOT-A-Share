@@ -1,8 +1,8 @@
 import { gate, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { sql, closeDb } from "@aihot/backend/db";
-import { paidRequest, logicalKeyFor, markStalePendingReceipts } from "@aihot/backend/providers/receipts";
+import { sql, closeDb, type Tx } from "@aihot/backend/db";
+import { paidRequest, logicalKeyFor, markStalePendingReceipts, ReceiptUnknownError } from "@aihot/backend/providers/receipts";
 after(closeDb);
 
 test("stale recovery waiting on a response transaction preserves its committed answer and attempt", async () => {
@@ -59,4 +59,32 @@ test("stale recovery waiting on a response transaction preserves its committed a
   assert.deepEqual(again.response, { saved: true });
   const [attempt] = await sql<{ status: string }[]>`SELECT status FROM receipt_attempts WHERE receipt_id = ${row!.id}`;
   assert.equal(attempt!.status, "received");
+});
+
+test("a lost commit acknowledgement preserves the received answer instead of downgrading it to unknown", async (t) => {
+  const request = { service: "invariant-commit-ack", purpose: "invariant_test", identity: tag() };
+  const begin = sql.begin.bind(sql);
+  let transactions = 0;
+  let sent = 0;
+  const injected = t.mock.method(sql, "begin", (async (callback: (tx: Tx) => Promise<unknown>) => {
+    const result = await begin(callback);
+    if (++transactions === 2) throw new Error("simulated lost acknowledgement after real commit");
+    return result;
+  }) as typeof sql.begin);
+  let receiptId = 0;
+  try {
+    await assert.rejects(paidRequest(request, async () => { sent++; return { response: { saved: true } }; }), (error) => {
+      assert.ok(error instanceof ReceiptUnknownError);
+      receiptId = error.receiptId;
+      return true;
+    });
+  } finally { injected.mock.restore(); }
+  const [row] = await sql`SELECT r.status, r.response, a.status AS attempt_status FROM receipts r
+    JOIN receipt_attempts a ON a.receipt_id = r.id WHERE r.id = ${receiptId}`;
+  assert.deepEqual(row, { status: "received", response: { saved: true }, attempt_status: "received" });
+  const cached = await paidRequest(request, async () => { sent++; return { response: { saved: false } }; });
+  assert.equal(sent, 1);
+  assert.equal(cached.reused, true);
+  assert.equal(cached.receiptId, receiptId);
+  assert.deepEqual(cached.response, { saved: true });
 });

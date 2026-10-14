@@ -1,6 +1,6 @@
 // A listing read through Jina is one paid request per fetch round (security audit S4, 2026-09-28): when
-// the outcome of a read is unknown, the next fetches do not pay again; ops.recover releases the receipt
-// once and only then is it read again, under the same receipt. A received page ends the round, so the
+// the outcome of a read is unknown, the next fetches do not pay again; an admin releases the receipt
+// after reconciliation and only then is it read again, under the same receipt. A received page ends the round, so the
 // fetch after it reads the listing afresh (#1452).
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -8,7 +8,7 @@ import http from "node:http";
 import { after, before, test } from "node:test";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
-import { autoReleaseUnknownReceipts } from "@aihot/backend/operations/recover";
+import { autoReleaseUnknownReceipts, releaseReceipt } from "@aihot/backend/operations/recover";
 import { stopBoss } from "@aihot/backend/jobs/queue";
 import { collectSource } from "@aihot/backend/sources/collect";
 import { previewStoredSource } from "@aihot/backend/admin/sources";
@@ -69,9 +69,12 @@ test("a listing read with an unknown outcome is not paid for again until it is r
   assert.equal((await receipts()).length, 1);
   assert.ok(await round(), "the round stays open while its read is unresolved");
 
-  // Released once by ops.recover, the same round is read again, under the same receipt.
+  // Time alone does not release the receipt. Explicit authorization resumes the same round.
   mode = "page";
   await autoReleaseUnknownReceipts(Date.now() + 31 * 60_000);
+  assert.equal((await collectSource(SOURCE, { force: true })).status, "failed");
+  assert.equal(hits, 1);
+  await releaseReceipt(first!.id, { billed: false, note: "provider checked; authorize resend" }, "test");
   const recovered = await collectSource(SOURCE, { force: true });
   assert.equal(recovered.status, "ok", recovered.error ?? "");
   assert.equal(recovered.created, 1);
