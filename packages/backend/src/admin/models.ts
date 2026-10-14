@@ -5,8 +5,35 @@
 import type { AdminModels, BeforeJson } from "@aihot/contracts/admin";
 import { sql } from "../db.ts";
 import { CAPABILITIES, invalidateModelCache, modelSources, type Capability, type CapabilityKey } from "../editorial/models.ts";
-import { MODELS } from "../providers/llm.ts";
+import { MODELS, type ModelSpec } from "../providers/llm.ts";
+import { isLingModel, LING_MODEL } from "../providers/model-profile.ts";
+import { credential } from "../config.ts";
 import { audit } from "../audit.ts";
+
+/** Display metadata only: do not resolve keys, parse request extras or invoke a provider. */
+function modelPresentation(spec: ModelSpec): { model: string; provider: string; label: string } {
+  const model = isLingModel(spec.model) ? LING_MODEL : spec.model;
+  let provider = spec.service;
+  if (provider === "llm") {
+    provider = isLingModel(model) ? "ant-ling" : /^glm-/i.test(model) ? "zhipu"
+      : /^deepseek-/i.test(model) ? "deepseek" : /^qwen/i.test(model) ? "dashscope"
+      : /^mimo-/i.test(model) ? "mimo" : "openai-compatible";
+    if (provider === "openai-compatible" && spec.key === "default") {
+      // Unknown deployment model names may still identify their provider by its official host.
+      // Follow the backend's environment/group-file precedence without exposing any endpoint data.
+      let host = "";
+      try { host = new URL(credential("models", spec.baseUrlEnv) ?? "").hostname; } catch { /* configuration is optional for display */ }
+      const hosts: Record<string, string> = {
+        "api.ant-ling.com": "ant-ling", "open.bigmodel.cn": "zhipu", "api.deepseek.com": "deepseek",
+        "dashscope.aliyuncs.com": "dashscope", "dashscope-intl.aliyuncs.com": "dashscope", "dashscope-us.aliyuncs.com": "dashscope",
+        "api.xiaomimimo.com": "mimo", "api.openai.com": "openai",
+      };
+      provider = hosts[host] ?? provider;
+    }
+  }
+  const prefix = spec.key === "default" || spec.key.toLowerCase() !== model.toLowerCase() ? `${spec.key} → ` : "";
+  return { model, provider, label: `${prefix}${model || "未配置模型"} (${provider})` };
+}
 
 interface UsageRow {
   purpose: string;
@@ -82,7 +109,7 @@ export async function modelsOverview(days = 7): Promise<BeforeJson<AdminModels>>
         estimate: priced(u),
       })),
   }));
-  const choices = Object.values(MODELS).map((m) => ({ key: m.key, service: m.service, vision: !!m.vision }));
+  const choices = Object.values(MODELS).map((m) => ({ key: m.key, service: m.service, vision: !!m.vision, ...modelPresentation(m) }));
   return { days, capabilities, choices, history, benches };
 }
 

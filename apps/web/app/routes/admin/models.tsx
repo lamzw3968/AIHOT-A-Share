@@ -25,6 +25,17 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
   const [target, setTarget] = useState<AdminModels["capabilities"][number] | null>(null);
   const [choice, setChoice] = useState<string>("");
   const labelOf = (key: string) => m.capabilities.find((c) => `capability:${c.key}` === key)?.label ?? key;
+  const modelLabel = (key: string) => {
+    const spec = m.choices.find((c) => c.key === key);
+    if (!spec) return key;
+    if (spec.label) return spec.label;
+    const provider = spec.provider ?? spec.service;
+    if (spec.model !== undefined) {
+      const prefix = key === "default" || key.toLowerCase() !== spec.model.toLowerCase() ? `${key} → ` : "";
+      return `${prefix}${spec.model || "未配置模型"} (${provider})`;
+    }
+    return `${key}（${provider}）`;
+  };
 
   return (
     <AdminPage
@@ -41,7 +52,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
               title={
                 <span className="inline-flex flex-wrap items-center gap-2">
                   {c.label}
-                  <span className="font-mono text-[12px] font-normal text-ink-3">{c.current.model}</span>
+                  <span className="font-mono text-[12px] font-normal text-ink-3">{modelLabel(c.current.model)}</span>
                   <Badge tone={c.current.source === "admin" ? "accent" : "muted"}>{SOURCE_LABEL[c.current.source]}</Badge>
                 </span>
               }
@@ -157,7 +168,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
               .filter((x) => x.vision === !!target?.vision)
               .map((x) => (
                 <option key={x.key} value={x.key}>
-                  {x.key}（{x.service}）
+                  {modelLabel(x.key)}
                 </option>
               ))}
             <option value="__default">恢复默认（{target?.env} 或 {target?.defaultModel}）</option>
