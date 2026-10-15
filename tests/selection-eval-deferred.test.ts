@@ -4,7 +4,7 @@ import { gate, Reply, stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { inspect, promisify } from "node:util";
@@ -16,6 +16,7 @@ import { providerQuotaKey } from "@aihot/backend/providers/provider-quotas";
 import { importSelectBenchRun } from "@aihot/backend/admin/selectbench";
 
 const exec = promisify(execFile);
+const outputRoots: string[] = [];
 const quality = ["accuracy", "precision", "recall", "f1", "selectedRate", "goldSelectRate"];
 const pass = { choices: [{ message: { content: '{"label":"PASS","reason":"fictional finance"}' } }], usage: { prompt_tokens: 10, completion_tokens: 5 } };
 const scored = { choices: [{ message: { content: '{"attentionScore":80}' } }], usage: { prompt_tokens: 20, completion_tokens: 10 } };
@@ -29,6 +30,7 @@ interface Report {
 async function evaluate(opts: { prefilter: string; score: string; models?: string; concurrency?: string; count?: number; env?: NodeJS.ProcessEnv }) {
   const marker = tag();
   const dir = mkdtempSync(path.join(tmpdir(), "selection-eval-protection-"));
+  outputRoots.push(dir);
   const gold = path.join(dir, "gold.jsonl");
   writeFileSync(gold, Array.from({ length: opts.count ?? 4 }, (_, i) => JSON.stringify({
     caseId: `${marker}-${i}`,
@@ -36,7 +38,7 @@ async function evaluate(opts: { prefilter: string; score: string; models?: strin
       sourceName: "Fictional finance source", bodyZh: null, bodyOriginal: `Fictional company ${marker}-${i} disclosed an order with amount and execution dates. `.repeat(8) },
     sourceFacts: { sourceKind: "rss", sourceTier: "T1", firstParty: true, language: "en" }, gold: { decision: "select" },
   })).join("\n"));
-  const env: NodeJS.ProcessEnv = { ...process.env, MODEL_CALLS_ENABLED: "true", PREFILTER_MODEL: "qwen3.7-flash",
+  const env: NodeJS.ProcessEnv = { ...process.env, AIHOT_DATA_DIR: path.join(dir, "data"), MODEL_CALLS_ENABLED: "true", PREFILTER_MODEL: "qwen3.7-flash",
     DASHSCOPE_BASE_URL: `${opts.prefilter}/v1`, DASHSCOPE_API_KEY: "dummy-eval-prefilter",
     ZHIPU_BASE_URL: `${opts.score}/v1`, ZHIPU_API_KEY: "dummy-eval-score",
     DEEPSEEK_BASE_URL: `${opts.score}/v1`, DEEPSEEK_API_KEY: "dummy-eval-deepseek",
@@ -63,7 +65,7 @@ async function evaluate(opts: { prefilter: string; score: string; models?: strin
   const reportPath = stdout.split(/\r?\n/).find((line) => line.startsWith("report: "))?.slice(8);
   let report: Report | null = null;
   if (reportPath) {
-    assert.equal(path.dirname(reportPath), path.join(REPO_ROOT, ".data/eval"));
+    assert.equal(path.dirname(reportPath), path.resolve(env.AIHOT_DATA_DIR!, "eval"));
     report = JSON.parse(readFileSync(reportPath, "utf8"));
     unlinkSync(reportPath);
   }
@@ -113,6 +115,7 @@ async function assertIncomplete(result: Awaited<ReturnType<typeof evaluate>>, ki
 }
 
 after(closeDb);
+after(() => { for (const dir of outputRoots) rmSync(dir, { recursive: true, force: true }); });
 
 test("429 stops new cases and later models while an already-started double score safely drains", async (t) => withRoutes(async () => {
   const release = gate();

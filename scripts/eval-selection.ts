@@ -6,10 +6,11 @@
 // Usage: node --env-file=.env scripts/eval-selection.ts --gold .data/gold.jsonl [--models default,deepseek-flash] [--n 200] [--label "..."]
 // Receipts make re-runs free; "either" cases are excluded from decisive metrics. Each run is also
 // imported into SelectBench (admin → SelectBench) with every case, unless --no-import is given.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { REPO_ROOT } from "@aihot/backend/config";
+import { config, REPO_ROOT } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import {
   SELECTION_PROMPT_VERSION,
@@ -117,6 +118,32 @@ function safeReportNamePart(value: string): string {
   return safe || "all";
 }
 
+function prepareOutputDirectory(): string {
+  const dir = path.resolve(config.dataDir, "eval");
+  const probe = path.join(dir, `.write-check-${randomUUID()}`);
+  let fd: number | undefined;
+  let created = false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    // Test an actual write, not just permission bits (ACLs, read-only mounts and quota can differ).
+    fd = openSync(probe, "wx", 0o600);
+    created = true;
+    writeSync(fd, "evaluation output check\n");
+    closeSync(fd);
+    fd = undefined;
+    unlinkSync(probe);
+    created = false;
+    return dir;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "write failed";
+    throw new Error(`Evaluation output directory is not writable: ${dir} (${code}). Set AIHOT_DATA_DIR to a writable persistent directory. No model requests were sent.`);
+  } finally {
+    // Cleanup must not replace the actionable preflight error if the filesystem also rejects it.
+    if (fd !== undefined) { try { closeSync(fd); } catch {} }
+    if (created) { try { unlinkSync(probe); } catch {} }
+  }
+}
+
 async function usageFor(receiptIds: number[]) {
   const ids = [...new Set(receiptIds)];
   if (!ids.length) return { tokensIn: 0, tokensOut: 0, avgLatencyMs: 0 };
@@ -134,6 +161,8 @@ async function usageFor(receiptIds: number[]) {
 }
 
 try {
+  // Fail before resolving models or starting any receipt/provider work, including cached runs.
+  const outDir = prepareOutputDirectory();
   const models = values.models
     ? values.models.split(",").map((model) => model.trim()).filter(Boolean)
     : [await modelFor("score")];
@@ -312,8 +341,6 @@ try {
     console.log(JSON.stringify(summary));
     console.log(sweep.map((s) => `  t=${s.t} acc=${s.acc} P=${s.P} R=${s.R} F1=${s.F1} sel=${s.sel}`).join("\n"));
   }
-  const outDir = path.join(REPO_ROOT, ".data/eval");
-  mkdirSync(outDir, { recursive: true });
   const splitName = safeReportNamePart(values.split!);
   const file = path.join(outDir, `selection-${splitName}-${sample.length}-${Date.now()}.json`);
   const meta = {
