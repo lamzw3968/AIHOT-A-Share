@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Evaluate the real CLI/receipts against loopback stubs, never a paid provider.
 import { gate, Reply, stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -6,8 +7,9 @@ import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+import { inspect, promisify } from "node:util";
 import { after, test } from "node:test";
+import { withIsolatedBudget as withBudget } from "./budget-fixture.ts";
 import { REPO_ROOT } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { providerQuotaKey } from "@aihot/backend/providers/provider-quotas";
@@ -47,7 +49,14 @@ async function evaluate(opts: { prefilter: string; score: string; models?: strin
       "--models", opts.models ?? "glm-5.3-flash-selection,deepseek-flash"], { cwd: REPO_ROOT, env, timeout: 25_000 });
     stdout = result.stdout; stderr = result.stderr;
   } catch (error) {
-    const result = error as { code: number; stdout: string; stderr: string };
+    const result = error as { code: number; stdout: string; stderr: string; signal?: string | null; killed?: boolean };
+    if (typeof result.code !== "number" || result.code > 255 || result.signal || result.killed) {
+      // Native crashes/timeouts may have empty stdout/stderr. Retain the original exec error and
+      // complete cause before the normal exit-code assertions fail; never retry a possibly paid CLI.
+      console.error("evaluation child abnormal exit", inspect({ node: process.version, executable: process.execPath,
+        exitCode: result.code, signal: result.signal, killed: result.killed, error },
+      { depth: null, showHidden: true, maxArrayLength: null, maxStringLength: null, colors: false }));
+    }
     assert.equal(typeof result.code, "number", "CLI must finish normally, not be killed by its test timeout");
     code = result.code; stdout = result.stdout; stderr = result.stderr;
   }
@@ -82,17 +91,6 @@ async function withRoutes<T>(fn: () => Promise<T>, imported = { runs: 0, results
     await sql`DELETE FROM settings WHERE key IN ('models.prefilter','models.score')`;
     for (const row of saved) await sql`INSERT INTO settings (key,value,updated_by,updated_at)
       VALUES (${row.key},${sql.json(row.value as never)},${row.updated_by},${row.updated_at})`;
-  }
-}
-
-async function withBudget<T>(service: string, limit: number, fn: () => Promise<T>) {
-  const [saved] = await sql`SELECT per_minute,per_hour,per_day FROM budgets WHERE service=${service}`;
-  await sql`INSERT INTO budgets (service,per_minute,per_hour,per_day) VALUES (${service},${limit},1000000,1000000)
-    ON CONFLICT (service) DO UPDATE SET per_minute=${limit},per_hour=1000000,per_day=1000000`;
-  try { return await fn(); }
-  finally {
-    if (saved) await sql`UPDATE budgets SET per_minute=${saved.per_minute},per_hour=${saved.per_hour},per_day=${saved.per_day} WHERE service=${service}`;
-    else await sql`DELETE FROM budgets WHERE service=${service}`;
   }
 }
 
@@ -198,8 +196,7 @@ test("budget exhaustion between the two scores preserves the first paid response
   const prefilter = await stub(() => pass);
   const score = await stub(() => scored);
   t.after(async () => { await Promise.all([prefilter.close(), score.close()]); });
-  const [used] = await sql`SELECT count(*)::int AS n FROM receipt_attempts WHERE service='zhipu' AND origin='live' AND started_at>now()-interval '1 minute'`;
-  await withBudget("zhipu", used!.n + 1, async () => {
+  await withBudget("zhipu", 1, async () => {
     const result = await evaluate({ prefilter: prefilter.url, score: score.url });
     await assertIncomplete(result, "budget");
     assert.equal(prefilter.hits(), 1); assert.equal(score.hits(), 1);
@@ -229,7 +226,7 @@ test("a connection lost after sending remains unknown and stops evaluation witho
     req.resume();
     req.on("end", () => { hits++; res.destroy(); });
   });
-  await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  await listenForFetch(provider);
   const endpoint = `http://127.0.0.1:${(provider.address() as { port: number }).port}`;
   const score = await stub(() => scored);
   t.after(async () => { await score.close(); await new Promise<void>((resolve) => provider.close(() => resolve())); });

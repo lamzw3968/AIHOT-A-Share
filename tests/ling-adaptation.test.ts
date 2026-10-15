@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Real receipts, quotas and pg-boss, with fake credentials and loopback HTTP only.
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -34,7 +35,7 @@ const server = http.createServer((req, res) => {
       } }], usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 } }));
   });
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`;
 let generation = 0;
 

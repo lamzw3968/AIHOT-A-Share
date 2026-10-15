@@ -1,3 +1,4 @@
+import { listenAppForFetch } from "./http-fixture.ts";
 // 撤回一篇报道不隐藏仍合法的其他报道，也不能留下可重新公开的事件副本。
 import { pair, story, source, article, rank, sourceVersion, cleanup } from "./events-oss-withdrawal-fixture.ts";
 import assert from "node:assert/strict";
@@ -17,7 +18,7 @@ import { ogEtag } from "../apps/api/src/og/render.ts";
 import { buildApp } from "../apps/api/src/app.ts";
 
 const app = await buildApp();
-const address = await app.listen({ host: "127.0.0.1", port: 0 });
+const address = await listenAppForFetch(app);
 const client = new Client({ name: "private-withdrawal-test", version: "1" });
 await client.connect(new StreamableHTTPClientTransport(new URL(address + "/api/mcp")));
 after(async () => { await client.close(); await app.close(); try { await cleanup(); } finally { await stopBoss(); await closeDb(); } });

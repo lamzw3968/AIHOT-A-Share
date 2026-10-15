@@ -5,6 +5,7 @@
 // one database and its paid-service budgets, so they run one at a time (package.json).
 import http from "node:http";
 import { Agent, buildConnector, setGlobalDispatcher } from "undici";
+import { listenForFetch } from "./http-fixture.ts";
 
 const database = new URL(process.env.DATABASE_URL ?? "postgres://unset/unset").pathname.slice(1);
 if (!/_(test|ci)$/.test(database)) {
@@ -63,7 +64,7 @@ export async function stub(answer: (hit: number, req: { url: string; body: strin
       res.end(JSON.stringify(reply.json));
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await listenForFetch(server);
   const { port } = server.address() as { port: number };
   return { url: `http://127.0.0.1:${port}`, hits: () => hits, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }

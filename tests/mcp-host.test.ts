@@ -1,3 +1,4 @@
+import { listenAppForFetch } from "./http-fixture.ts";
 import "./setup.ts";
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
@@ -107,7 +108,7 @@ test("MCP rejects an empty Host received over HTTP", async () => {
   const server = Fastify();
   registerMcp(server);
   try {
-    const address = await server.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenAppForFetch(server);
     const response = await rawRequest(address, ["Host", ""]);
     assert.equal(response.status, 421, response.body);
     assert.deepEqual(JSON.parse(response.body), { error: "misdirected_request" });
@@ -122,7 +123,7 @@ test("MCP rejects repeated effective authority headers over HTTP", async () => {
   const server = Fastify();
   registerMcp(server);
   try {
-    const address = await server.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenAppForFetch(server);
     for (const headers of [
       ["Host", "[::1]", "Host", "evil.invalid"],
       ["Host", "localhost", "Host", "localhost"],

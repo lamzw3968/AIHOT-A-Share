@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 import { tag } from './setup.ts';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -27,7 +28,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'application/rss+xml', ...(etag ? { etag } : {}), 'last-modified': modified });
   res.end(broken ? '<not-feed/>' : `<rss version="2.0"><channel><title>Feed</title>${entries}</channel></rss>`);
 });
-await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+await listenForFetch(server);
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 config.allowPrivateNetworkFetch = true;
 after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); await stopBoss(); await closeDb(); });

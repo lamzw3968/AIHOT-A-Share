@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -23,7 +24,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true }));
   });
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 let parked: Array<{ id: string; start_after: Date }> = [];
 before(async () => {

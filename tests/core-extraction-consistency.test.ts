@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Failure cases: two workers finish the same extraction; a report revises the article while a page
 // or X Article is in flight; an obsolete empty response marks new input unconfirmed; an admin
 // repeats extraction of unchanged HTML. Neither content nor revision history may go backwards.
@@ -21,7 +22,7 @@ const page = http.createServer(async (_req, res) => {
   res.writeHead(200, { "content-type": "text/html" });
   res.end(hold.empty ? "<html><body>Empty</body></html>" : `<html><head><title>Original</title></head><body><article><h1>Original</h1><p>${body}</p></article></body></html>`);
 });
-await new Promise<void>(resolve => page.listen(0, "127.0.0.1", resolve));
+await listenForFetch(page);
 const base = `http://127.0.0.1:${(page.address() as { port: number }).port}`;
 const socialdata = await stub(async () => {
   hold.entered.open();

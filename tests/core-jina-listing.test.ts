@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // A listing read through Jina is one paid request per fetch round (security audit S4, 2026-09-28): when
 // the outcome of a read is unknown, the next fetches do not pay again; an admin releases the receipt
 // after reconciliation and only then is it read again, under the same receipt. A received page ends the round, so the
@@ -31,7 +32,7 @@ const jina = http.createServer((req, res) => {
   if (mode === "invalid") return void res.end("Upstream temporarily unavailable");
   res.end(`Title: News\nURL Source: https://example.org/news/\n\nMarkdown Content:\n# [Post ${hits} ${T}](https://example.org/news/post-${hits}-${T})\n`);
 });
-await new Promise<void>((resolve) => jina.listen(0, "127.0.0.1", () => resolve()));
+await listenForFetch(jina);
 process.env.JINA_BASE_URL = `http://127.0.0.1:${(jina.address() as { port: number }).port}`;
 process.env.JINA_API_KEY = "test-key";
 config.allowPrivateNetworkFetch = true;

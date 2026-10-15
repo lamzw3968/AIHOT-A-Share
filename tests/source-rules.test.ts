@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Every rule a source's config names is applied, and a name the collector does not implement fails the
 // fetch. Configs that carried adapters and detail rules a collector does not implement used to fall
 // back silently (junk titles, RSS entries outside the source's URL rules, dates from the wrong place).
@@ -47,7 +48,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(body === null ? 404 : 200, { "content-type": path.endsWith(".xml") ? "application/rss+xml" : "text/html; charset=utf-8" });
   res.end(body ?? "");
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+await listenForFetch(server);
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 config.allowPrivateNetworkFetch = true;
 process.env.JINA_BASE_URL = base;

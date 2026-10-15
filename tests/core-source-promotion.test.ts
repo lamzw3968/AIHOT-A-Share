@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // 信源转为编辑来源后，补齐尚未分析的资料；沿用正文、历史归档和人工覆盖规则。
 import { stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -39,7 +40,7 @@ const page = http.createServer((_req, res) => {
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(`<html><head><title>Company contract</title></head><body><article><h1>Company contract</h1><p>${BODY}</p></article></body></html>`);
 });
-await new Promise<void>((resolve) => page.listen(0, "127.0.0.1", resolve));
+await listenForFetch(page);
 const pageUrl = `http://127.0.0.1:${(page.address() as { port: number }).port}`;
 config.modelCallsEnabled = true;
 config.allowPrivateNetworkFetch = true;

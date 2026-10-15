@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // 重定向测试只使用虚构凭据和回环服务；HTTPS 分支使用禁止联网的传输替身。
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -26,7 +27,7 @@ async function fixture() {
     if (route) await route(hit, res);
     else { res.writeHead(200, { "content-type": "application/json" }); res.end('{"code":0,"title":"fixture","content":"fixture"}'); }
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  await listenForFetch(server);
   return { hits, routes, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 const a = await fixture();

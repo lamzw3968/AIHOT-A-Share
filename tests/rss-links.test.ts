@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Atom link bases are inherited from feed to entry to link, starting at the fetched document URL.
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -26,7 +27,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("content-type", "application/atom+xml");
   res.end(pages[req.url!] ?? "");
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const root = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 const previousPrivateFetch = config.allowPrivateNetworkFetch;
 config.allowPrivateNetworkFetch = true;

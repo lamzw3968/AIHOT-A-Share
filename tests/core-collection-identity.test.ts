@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Failure cases: tracking aliases miss the stored article, duplicate cards buy duplicate detail
 // requests, fragment-aware HTML lists collapse separate updates, invalid epoch values abort a run.
 import { tag } from "./setup.ts";
@@ -28,7 +29,7 @@ const server = http.createServer(async (req, res) => {
       Array.from({ length: 10 }, (_, i) => `<a href="/post?utm_source=${campaign}${i}">Read more</a>`).join(""));
   }
 });
-await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 config.allowPrivateNetworkFetch = true;
 after(async () => { server.close(); await stopBoss(); await closeDb(); });
