@@ -23,6 +23,9 @@ export class BudgetExceededError extends Error {
 
 export class ReceiptBusyError extends Error {}
 
+/** A historical request may overlap, but its stored identity cannot prove it. */
+export class LegacyReceiptAmbiguousError extends Error {}
+
 export class ReceiptUnknownError extends Error {
   readonly receiptId: number;
   constructor(receiptId: number, message: string) {
@@ -58,6 +61,9 @@ export interface ReceiptRequest {
   subject?: string | null;
   /** Everything that determines the output. Hashed into the logical key; only a redacted summary is stored. */
   identity: unknown;
+  /** During body-hash canonicalization, protect unresolved wire-hash keys and reuse exact old successes. */
+  legacyBodyHashIdentity?: Record<string, unknown>;
+  legacyArrayUser?: boolean;
   /** Stored for diagnosis; must not contain secrets. */
   requestSummary?: Record<string, unknown>;
   /** Distinguishes an explicit re-run (e.g. admin "re-evaluate") from recovery of the same request. */
@@ -120,11 +126,80 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
   const claim = () => sql.begin(async (tx) => {
     // Serialise budget checks per service so concurrent workers cannot overshoot.
     await tx`SELECT pg_advisory_xact_lock(hashtext(${"budget:" + req.service}))`;
-    const [existing] = await tx<ReceiptRow[]>`
+    let [existing] = await tx<ReceiptRow[]>`
       SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE logical_key = ${logicalKey} FOR UPDATE`;
+    if (req.legacyBodyHashIdentity) {
+      const identity = req.legacyBodyHashIdentity;
+      const summary = req.requestSummary ?? {};
+      const wireHash = summary.bodyHash;
+      const wireKey = typeof wireHash === "string"
+        ? logicalKeyFor({ ...req, identity: { ...identity, bodyHash: wireHash } }) : null;
+      const previousKey = logicalKeyFor({ ...req, identity });
+      // Retain ambiguous old unknown attempts even after the receipt was released.
+      const candidates = await tx<(ReceiptRow & { logical_key: string; request: Record<string, unknown> | null; authorized: boolean })[]>`
+        SELECT r.id, r.status, r.response, r.error, r.created_at, r.updated_at, r.logical_key, r.request,
+          EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'receipt.release' AND a.subject = 'receipt:' || r.id
+            AND a.actor <> 'ops.recover' AND a.before->>'status' = 'unknown'
+            AND a.after->>'status' = 'failed' AND a.after->>'resendAuthorized' = 'true'
+            AND jsonb_typeof(a.after->'billed') = 'boolean'
+            AND a.created_at >= (SELECT max(x.finished_at) FROM receipt_attempts x WHERE x.receipt_id = r.id AND x.status = 'unknown')) AS authorized
+        FROM receipts r
+        WHERE r.service = ${req.service} AND r.model IS NOT DISTINCT FROM ${req.model ?? null}
+          AND r.purpose = ${req.purpose}
+          AND (r.status IN ('pending', 'unknown') OR
+            (r.status = 'failed' AND (r.error LIKE ${LEGACY_AUTO_RELEASE_NOTE + "%"} OR
+              EXISTS (SELECT 1 FROM receipt_attempts a WHERE a.receipt_id = r.id AND a.status = 'unknown'))))
+        ORDER BY r.id FOR UPDATE OF r`;
+      let ambiguous: typeof candidates[number] | undefined;
+      for (const row of candidates) {
+        const prefix = [req.service, req.purpose, req.model ?? "-"].join(":") + ":";
+        const suffix = row.logical_key.startsWith(prefix) ? row.logical_key.slice(prefix.length) : "";
+        if (/^[0-9a-f]{64}:/.test(suffix) && suffix.slice(65) !== (req.attemptTag ?? "0")) continue;
+        const exactCurrent = row.logical_key === logicalKey || row.logical_key === wireKey || row.logical_key === previousKey;
+        const stored = row.request && typeof row.request === "object" && !Array.isArray(row.request) ? row.request : {};
+        const validHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+        // Old summaries are unauthenticated. Reconstruct every identity field from the
+        // summary before using any of them to prove a candidate is a different request.
+        const recordedKey = typeof stored.promptVersion === "string" && validHash(stored.systemHash) &&
+          validHash(stored.userHash) && validHash(stored.bodyHash) &&
+          typeof stored.temperature === "number" && typeof stored.maxTokens === "number"
+          ? logicalKeyFor({ ...req, identity: { ...identity, promptVersion: stored.promptVersion,
+              system: stored.systemHash, user: stored.userHash, temperature: stored.temperature,
+              maxTokens: stored.maxTokens, bodyHash: stored.bodyHash } }) : null;
+        const verified = recordedKey === row.logical_key;
+        const differentVerifiedIdentity = verified && (
+          stored.promptVersion !== identity.promptVersion || stored.systemHash !== identity.system ||
+          stored.temperature !== identity.temperature || stored.maxTokens !== identity.maxTokens ||
+          (!req.legacyArrayUser && stored.userHash !== summary.userHash));
+        if (!exactCurrent && differentVerifiedIdentity) continue;
+        const sameOldFamily = verified && !differentVerifiedIdentity && stored.userHash === summary.userHash;
+        if (row.status === "failed" && row.authorized && exactCurrent) {
+          if (!existing) existing = row;
+          continue;
+        }
+        if (sameOldFamily || exactCurrent) {
+          if (row.status === "pending" && Date.now() - row.updated_at.getTime() < PENDING_STALE_MS) return { kind: "busy" as const, row };
+          if (row.status === "pending" || (row.status === "failed" && row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
+            await markUnknown(tx, row.id, "legacy body hash requires manual reconciliation and resend authorization");
+          }
+          if (row.status !== "failed" || row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE)) return { kind: "unknown" as const, row };
+        }
+        ambiguous ??= row;
+      }
+      if (ambiguous) return { kind: "ambiguous" as const, row: ambiguous };
+      if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
+      if (!existing || (existing.status === "failed" && !existing.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
+        for (const key of new Set([wireKey, previousKey])) {
+          if (!key || key === logicalKey) continue;
+          const [saved] = await tx<ReceiptRow[]>`
+            SELECT id, status, response, error, created_at, updated_at FROM receipts
+            WHERE logical_key = ${key} AND status IN ('received', 'completed') FOR UPDATE`;
+          if (saved) return { kind: "reuse" as const, row: saved };
+        }
+      }
+    }
     if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
-    // Finish business writes from saved answers during shutdown, but never reserve or send the
-    // next paid page/batch. An answer already in flight still saves below, without this check.
+    // Saved results may finish during shutdown, but no new request may be reserved.
     shutdownSignal.signal.throwIfAborted();
     if (existing) {
       // Upgraded workers may pick up work queued by the old timed release. That release is not
@@ -175,6 +250,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
 
   if (claimed.kind === "reuse") return { receiptId: claimed.row.id, response: claimed.row.response, reused: true };
   if (claimed.kind === "busy") throw new ReceiptBusyError(`Receipt ${claimed.row.id} is in flight`);
+  if (claimed.kind === "ambiguous") throw new LegacyReceiptAmbiguousError(`Historical receipt ${claimed.row.id} has an unresolved ambiguous identity`);
   if (claimed.kind === "unknown") {
     throw unknownOutcome(claimed.row.id);
   }
@@ -233,12 +309,21 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
     // A response may have been paid for even if encoding/storage (or its commit acknowledgement)
     // failed. Best effort only: a DB outage leaves pending, which still blocks sending and becomes
     // unknown on recovery. Never downgrade a received/completed answer after an ambiguous commit.
-    await sql.begin(async (tx) => {
+    // A committed response whose acknowledgement was lost can still finish this business run,
+    // but only after the receipt AND this attempt prove that the saved answer is complete.
+    const recovered = await sql.begin(async (tx) => {
       const changed = await tx`UPDATE receipts SET status = 'unknown', error = 'response persistence outcome unknown', updated_at = now()
         WHERE id = ${receiptId} AND status = 'pending' RETURNING id`;
       if (changed.length) await tx`UPDATE receipt_attempts SET status = 'unknown', error = 'response persistence outcome unknown',
         latency_ms = ${Date.now() - started}, finished_at = now() WHERE id = ${attemptId} AND status = 'pending'`;
-    }).catch(() => {});
+      const [saved] = await tx<{ response: unknown }[]>`
+        SELECT r.response FROM receipts r JOIN receipt_attempts a ON a.receipt_id = r.id
+        WHERE r.id = ${receiptId} AND r.status IN ('received', 'completed') AND r.received_at IS NOT NULL
+          AND r.response IS NOT NULL AND r.response <> 'null'::jsonb
+          AND a.id = ${attemptId} AND a.attempt = r.attempts AND a.status = 'received' AND a.finished_at IS NOT NULL`;
+      return saved;
+    }).catch(() => undefined);
+    if (recovered) return { receiptId, response: recovered.response, reused: true };
     throw unknownOutcome(receiptId);
   }
   return { receiptId, response: outcome.response, reused: false };

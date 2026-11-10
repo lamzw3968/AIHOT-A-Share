@@ -3,7 +3,7 @@
 // environment variable or the admin's model page picks one of the named presets below.
 import type { z } from "zod";
 import { config, credential } from "../config.ts";
-import { sha256 } from "../lib/ids.ts";
+import { sha256, stableJson } from "../lib/ids.ts";
 import { completeReceipt, paidRequest, ProviderRejectedError, rejectReceivedResponse } from "./receipts.ts";
 import { sql } from "../db.ts";
 import { assertLingConfiguration, isLingModel, LING_MODEL, lingChatEndpoint, lingDefaultMatches, lingProfile, lingQuota } from "./model-profile.ts";
@@ -250,14 +250,16 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
     ...(extra ?? {}),
   };
 
+  const identity = { model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(ling && Array.isArray(opts.user) ? stableJson(opts.user) : userText), temperature, maxTokens, extra: extra ?? null,
+    ...(ling ? { bodyHash: sha256(stableJson(body)) } : {}) };
   const receipt = await paidRequest(
     {
       service: spec.service,
       model,
       purpose: opts.purpose,
       subject: opts.subject,
-      identity: { model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: extra ?? null,
-        ...(ling ? { bodyHash: sha256(JSON.stringify(body)) } : {}) },
+      identity,
+      ...(ling ? { legacyBodyHashIdentity: { ...identity, user: sha256(userText) }, legacyArrayUser: Array.isArray(opts.user) } : {}),
       requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens,
         ...(glm || ling ? { model, bodyHash: sha256(JSON.stringify(body)) } : {}) },
       attemptTag: opts.attemptTag,
