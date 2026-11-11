@@ -250,8 +250,12 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
     ...(extra ?? {}),
   };
 
-  const identity = { model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(ling && Array.isArray(opts.user) ? stableJson(opts.user) : userText), temperature, maxTokens, extra: extra ?? null,
+  const previousIdentity = { model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(ling && Array.isArray(opts.user) ? stableJson(opts.user) : userText), temperature, maxTokens, extra: extra ?? null,
     ...(ling ? { bodyHash: sha256(stableJson(body)) } : {}) };
+  // Store only digests in the versioned identity: operator extras can contain private values.
+  const identity = ling ? { version: 2, model, promptVersion: opts.promptVersion, system: previousIdentity.system,
+    user: previousIdentity.user, temperature, maxTokens, extraHash: sha256(stableJson(extra ?? null)), bodyHash: sha256(stableJson(body)) }
+    : previousIdentity;
   const receipt = await paidRequest(
     {
       service: spec.service,
@@ -259,9 +263,10 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
       purpose: opts.purpose,
       subject: opts.subject,
       identity,
-      ...(ling ? { legacyBodyHashIdentity: { ...identity, user: sha256(userText) }, legacyArrayUser: Array.isArray(opts.user) } : {}),
+      ...(ling ? { legacyBodyHashIdentity: { ...previousIdentity, user: sha256(userText) }, legacyCanonicalIdentity: previousIdentity,
+        legacyArrayUser: Array.isArray(opts.user) } : {}),
       requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens,
-        ...(glm || ling ? { model, bodyHash: sha256(JSON.stringify(body)) } : {}) },
+        ...(glm || ling ? { model, bodyHash: sha256(JSON.stringify(body)) } : {}), ...(ling ? { identityV2: identity } : {}) },
       attemptTag: opts.attemptTag,
       quota,
     },

@@ -1,6 +1,6 @@
 import { listenForFetch } from "./http-fixture.ts";
 // Real receipts, quotas and pg-boss, with fake credentials and loopback HTTP only.
-import { tag } from "./setup.ts";
+import { gate, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { after, test } from "node:test";
@@ -22,12 +22,19 @@ const schema = z.object({ ok: z.boolean() });
 const system = "Return test JSON";
 const seen: Array<{ body: Record<string, unknown>; url: string; at: number }> = [];
 let reply: { status?: number; headers?: Record<string, string>; raw?: string; content?: unknown; missing?: boolean; finish?: string; score?: boolean; noId?: boolean } = {};
+let heldReply: { subject: string; arrived: ReturnType<typeof gate<void>>; release: ReturnType<typeof gate<void>> } | undefined;
 const server = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on("data", (c: Buffer) => chunks.push(c));
-  req.on("end", () => {
-    seen.push({ body: JSON.parse(Buffer.concat(chunks).toString("utf8")), url: req.url!, at: Date.now() });
+  req.on("end", async () => {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    seen.push({ body, url: req.url!, at: Date.now() });
     assert.match(String(req.headers.authorization), /^Bearer dummy-ling-/);
+    const held = heldReply;
+    if (held && JSON.stringify(body.messages).includes(held.subject)) {
+      held.arrived.open();
+      await held.release.promise;
+    }
     res.writeHead(reply.status ?? 200, { "content-type": "application/json", "x-request-id": `header-${T}`, ...reply.headers });
     res.end(reply.raw ?? JSON.stringify({ ...(reply.noId ? {} : { id: `ling-${T}-${seen.length}` }),
       choices: [{ finish_reason: reply.finish ?? "stop", message: {
@@ -56,6 +63,12 @@ function ask(subject: string, opts: { model?: string; maxTokens?: number; timeou
   return chatJson({ model: opts.model ?? "default", purpose: opts.purpose ?? "ling_adaptation_test", subject,
     promptVersion: "ling-v1", system, user: `input ${subject}`, schema, maxTokens: opts.maxTokens ?? 512, ...opts,
     attemptTag: opts.attemptTag ?? fixtureTag(subject) });
+}
+
+// Mirrors the production default: no explicit attemptTag or fixtureTag.
+function askDefault(subject: string, purpose: string) {
+  return chatJson({ model: "default", purpose, subject, promptVersion: "ling-v1", system,
+    user: `input ${subject}`, schema, maxTokens: 512 });
 }
 
 async function counts(subject: string) {
@@ -88,14 +101,14 @@ async function oldLingAnswer(subject: string, extra: Record<string, unknown> | n
   const body = seen.at(-1)!.body;
   const key = lingKey(subject, body, extra, opts.attemptTag);
   // Recreate the old wire-hash identity, preserving the actually received response and attempt.
-  await sql`UPDATE receipts SET logical_key=${key} WHERE id=${result.receiptId}`;
+  await sql`UPDATE receipts SET logical_key=${key},request=request - 'identityV2' WHERE id=${result.receiptId}`;
   return { ...result, body, key };
 }
 
 async function unknownCopy(receiptId: number, key: string, bodyHash: string): Promise<number> {
   // Independent historical request fixture: never change the successful receipt or its attempt.
   const [row] = await sql`INSERT INTO receipts (logical_key,service,model,purpose,subject,status,request,attempts)
-    SELECT ${key},service,model,purpose,subject,'unknown',request || ${sql.json({ bodyHash })},1 FROM receipts WHERE id=${receiptId} RETURNING id`;
+    SELECT ${key},service,model,purpose,subject,'unknown',(request - 'identityV2') || ${sql.json({ bodyHash })},1 FROM receipts WHERE id=${receiptId} RETURNING id`;
   await sql`INSERT INTO receipt_attempts (receipt_id,attempt,service,model,status,finished_at)
     SELECT id,1,service,model,'unknown',now() FROM receipts WHERE id=${row!.id}`;
   return row!.id;
@@ -272,9 +285,11 @@ test("usage, request ID, raw response and effective request summary are retained
   assert.equal(typeof row!.response._latencyMs, "number");
   assert.deepEqual(row!.usage, result.usage);
   assert.equal(row!.request.bodyHash, sha256(JSON.stringify(seen.at(-1)!.body)));
+  assert.deepEqual(row!.request.identityV2, { version: 2, model: "Ling-3.1-flash", promptVersion: "ling-v1",
+    system: sha256(system), user: sha256(`input ${subject}`), temperature: 0.6, maxTokens: 777,
+    extraHash: sha256(stableJson({ max_tokens: 777, temperature: 0.6 })), bodyHash: sha256(stableJson(seen.at(-1)!.body)) });
   assert.equal(row!.logical_key, logicalKeyFor({ service: "llm", model: "Ling-3.1-flash", purpose: "ling_adaptation_test", subject, attemptTag: fixtureTag(subject),
-    identity: { model: "Ling-3.1-flash", promptVersion: "ling-v1", system: sha256(system), user: sha256(`input ${subject}`),
-      temperature: 0.6, maxTokens: 777, extra: { max_tokens: 777, temperature: 0.6 }, bodyHash: sha256(stableJson(seen.at(-1)!.body)) } }));
+    identity: row!.request.identityV2 }));
 });
 
 test("truncation rejects even valid JSON before custom parsing and without a hidden paid retry", async () => {
@@ -390,6 +405,114 @@ test("reordering Ling extras and nested object keys reuses the saved answer with
   assert.deepEqual(await counts(subject), { receipts: 1, attempts: 1 });
 });
 
+test("default attemptTag lets two different Ling articles send while the first is pending", async () => {
+  configure();
+  Object.assign(process.env, { ANT_LING_QPS: "1000", ANT_LING_MAX_INFLIGHT: "2" });
+  const purpose = `default-concurrent-${T}`;
+  const a = `article:default-pending-a-${T}@1`;
+  const b = `article:default-pending-b-${T}@1`;
+  const held = { subject: a, arrived: gate(), release: gate() };
+  heldReply = held;
+  const hits = seen.length;
+  const first = askDefault(a, purpose);
+  try {
+    await held.arrived.promise;
+    const [pending] = await sql`SELECT r.status, r.attempts, a.status AS attempt_status FROM receipts r
+      JOIN receipt_attempts a ON a.receipt_id=r.id WHERE r.subject=${a}`;
+    assert.deepEqual(pending, { status: "pending", attempts: 1, attempt_status: "pending" });
+    await assert.rejects(askDefault(a, purpose), ReceiptBusyError);
+    const second = await askDefault(b, purpose);
+    assert.equal(second.reused, false);
+    assert.deepEqual(second.data, { ok: true });
+    assert.equal(seen.length, hits + 2);
+    assert.deepEqual(await counts(a), { receipts: 1, attempts: 1 });
+    assert.deepEqual(await counts(b), { receipts: 1, attempts: 1 });
+  } finally {
+    heldReply = undefined;
+    held.release.open();
+    await first;
+  }
+  assert.equal((await askDefault(a, purpose)).reused, true);
+  assert.equal(seen.length, hits + 2);
+});
+
+for (const status of ["unknown", "received", "completed", "failed"] as const) {
+  test(`default attemptTag keeps a distinct Ling article independent of ${status}`, async () => {
+    configure();
+    Object.assign(process.env, { ANT_LING_QPS: "1000", ANT_LING_MAX_INFLIGHT: "2" });
+    const purpose = `default-distinct-${status}-${T}`;
+    const a = `article:default-${status}-a-${T}@1`;
+    const b = `article:default-${status}-b-${T}@1`;
+    const hits = seen.length;
+    let firstId = 0;
+    if (status === "unknown") {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (url, init) => { await originalFetch(url, init); throw new Error("loopback response lost after send"); };
+      try {
+        await assert.rejects(askDefault(a, purpose), (error: unknown) => {
+          assert.ok(error instanceof ReceiptUnknownError);
+          firstId = error.receiptId;
+          return true;
+        });
+      } finally { globalThis.fetch = originalFetch; }
+    } else if (status === "failed") {
+      reply = { status: 503 };
+      await assert.rejects(askDefault(a, purpose), ProviderRejectedError);
+      reply = {};
+    } else {
+      const first = await askDefault(a, purpose);
+      firstId = first.receiptId;
+      if (status === "completed") await completeReceipt(sql, firstId);
+    }
+    const before = await sql`SELECT r.id,r.status,r.attempts,a.status AS attempt_status FROM receipts r
+      JOIN receipt_attempts a ON a.receipt_id=r.id WHERE r.subject=${a}`;
+    assert.equal(before.length, 1);
+    assert.equal(before[0]!.status, status);
+    const second = await askDefault(b, purpose);
+    assert.equal(second.reused, false);
+    assert.deepEqual(second.data, { ok: true });
+    assert.equal(seen.length, hits + 2);
+    assert.deepEqual(await counts(a), { receipts: 1, attempts: 1 });
+    assert.deepEqual(await counts(b), { receipts: 1, attempts: 1 });
+    if (status === "unknown") {
+      await assert.rejects(askDefault(a, purpose), (error: unknown) => error instanceof ReceiptUnknownError && error.receiptId === firstId);
+    } else if (status === "received" || status === "completed") {
+      const cached = await askDefault(a, purpose);
+      assert.equal(cached.receiptId, firstId);
+      assert.equal(cached.reused, true);
+    }
+    assert.deepEqual(await sql`SELECT r.id,r.status,r.attempts,a.status AS attempt_status FROM receipts r
+      JOIN receipt_attempts a ON a.receipt_id=r.id WHERE r.subject=${a}`, before);
+    assert.equal(seen.length, hits + 2, "unknown is not released and cached answers are not resent");
+  });
+}
+
+test("a damaged v2 identity cannot be used as proof to bypass an unknown or its release", async () => {
+  configure();
+  Object.assign(process.env, { ANT_LING_QPS: "1000", ANT_LING_MAX_INFLIGHT: "2" });
+  const purpose = `default-damaged-v2-${T}`;
+  const a = `article:damaged-v2-a-${T}@1`;
+  const b = `article:damaged-v2-b-${T}@1`;
+  const hits = seen.length;
+  const originalFetch = globalThis.fetch;
+  let receiptId = 0;
+  globalThis.fetch = async (url, init) => { await originalFetch(url, init); throw new Error("loopback response lost after send"); };
+  try {
+    await assert.rejects(askDefault(a, purpose), (error: unknown) => {
+      assert.ok(error instanceof ReceiptUnknownError);
+      receiptId = error.receiptId;
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+  await sql`UPDATE receipts SET request=jsonb_set(request, '{identityV2,extraHash}', ${sql.json("f".repeat(64))}::jsonb) WHERE id=${receiptId}`;
+  await assert.rejects(askDefault(b, purpose), LegacyReceiptAmbiguousError);
+  await releaseReceipt(receiptId, { billed: false, note: "fixture identity remains unverified" }, "ling-test");
+  await assert.rejects(askDefault(b, purpose), LegacyReceiptAmbiguousError);
+  assert.deepEqual(await counts(a), { receipts: 1, attempts: 1 });
+  assert.deepEqual(await counts(b), { receipts: 0, attempts: 0 });
+  assert.equal(seen.length, hits + 1);
+});
+
 test("reordered Ling extras cannot resend an unknown request after its quota lease expires", async () => {
   configure();
   // As above, nested metadata exercises hashing only against our local fixture.
@@ -445,7 +568,7 @@ for (const state of ["unknown", "pending", "stale-pending", "legacy-auto-release
         temperature: body.temperature, maxTokens: body.max_tokens, extra: original, bodyHash: sha256(JSON.stringify(body)) } });
     // Recreate the persisted identity/status produced by the previous implementation, retaining the actual sent attempt.
     const status = state === "legacy-auto-release" ? "failed" : state === "unknown" ? "unknown" : "pending";
-    await sql`UPDATE receipts SET logical_key=${oldKey},status=${status},
+    await sql`UPDATE receipts SET logical_key=${oldKey},request=request - 'identityV2',status=${status},
       error=${state === "legacy-auto-release" ? "自动放行：结果未知超过 30 分钟，未核对是否计费" : null},
       updated_at=${new Date(Date.now() - (state === "stale-pending" ? 11 * 60_000 : 0))} WHERE id=${receiptId}`;
     await sql`UPDATE receipt_attempts SET status=${state === "pending" || state === "stale-pending" ? "pending" : "unknown"} WHERE receipt_id=${receiptId}`;
@@ -487,6 +610,47 @@ for (const status of ["received", "completed"] as const) {
       }
       assert.equal(seen.length, hits);
       assert.deepEqual(await paidState(subject), before, "old keys, attempts and quota remain unchanged; no budget attempt is added");
+      assert.deepEqual(await counts(subject), { receipts: 1, attempts: 1 });
+    });
+  });
+}
+
+for (const status of ["received", "completed"] as const) {
+  test(`107 canonical Ling ${status} cache survives nested property reordering without a new attempt`, async () => {
+    const original = { response_format: { type: "text" }, top_p: 0.8, mock_only_nested: { z: 1, a: { second: 2, first: 1 } } };
+    const reordered = { mock_only_nested: { a: { first: 1, second: 2 }, z: 1 }, top_p: 0.8, response_format: { type: "text" } };
+    assert.deepEqual(original, reordered);
+    configure(original);
+    const subject = `legacy-107-cache-${status}-${T}`;
+    const old = await ask(subject, { json: false });
+    const body = seen.at(-1)!.body;
+    const wireHash = sha256(JSON.stringify(body));
+    const canonicalHash = sha256(stableJson(body));
+    assert.notEqual(wireHash, canonicalHash, "the 107 canonical key and wire key must differ in this fixture");
+    const key = lingKey(subject, body, original, undefined, canonicalHash);
+    // Preserve the real response and wire summary, replacing only the identity with the
+    // unversioned canonical identity written by 107 and removing the new v2 metadata.
+    await sql`UPDATE receipts SET logical_key=${key},request=request - 'identityV2' WHERE id=${old.receiptId}`;
+    if (status === "completed") await completeReceipt(sql, old.receiptId);
+    const [stored] = await sql`SELECT logical_key,request FROM receipts WHERE id=${old.receiptId}`;
+    assert.equal(stored!.logical_key, key);
+    assert.equal(stored!.request.bodyHash, wireHash);
+    assert.equal(stored!.request.identityV2, undefined);
+    const quota = lingQuota(endpoint, process.env.LLM_API_KEY!, 85_000);
+    await sql`UPDATE provider_quotas SET cooldown_until=now()+interval '1 hour',next_start_at=now()+interval '1 hour' WHERE quota_key=${quota.key}`;
+    await withStoppedLlmBudget(async () => {
+      const hits = seen.length;
+      const before = await paidState(subject);
+      for (const extra of [original, reordered]) {
+        process.env.LLM_EXTRA_JSON = JSON.stringify(extra);
+        const cached = await ask(subject, { json: false });
+        assert.equal(cached.receiptId, old.receiptId);
+        assert.equal(cached.reused, true);
+        assert.deepEqual(cached.data, { ok: true });
+        assert.deepEqual(cached.usage, old.usage);
+      }
+      assert.equal(seen.length, hits);
+      assert.deepEqual(await paidState(subject), before, "the old receipt, attempt, budget and quota remain unchanged");
       assert.deepEqual(await counts(subject), { receipts: 1, attempts: 1 });
     });
   });
@@ -603,7 +767,7 @@ for (const generation of ["new", "old-wire", "old-canonical"] as const) {
         identity: { model: "Ling-3.1-flash", promptVersion: "ling-v1", system: sha256(system),
           user: sha256(JSON.stringify(original)), temperature: body.temperature, maxTokens: body.max_tokens, extra: null,
           bodyHash: sha256(generation === "old-wire" ? JSON.stringify(body) : stableJson(body)) } });
-      await sql`UPDATE receipts SET logical_key=${key} WHERE id=${receiptId}`;
+      await sql`UPDATE receipts SET logical_key=${key},request=request - 'identityV2' WHERE id=${receiptId}`;
     }
     await assert.rejects(call(reordered), (error: unknown) => {
       assert.ok(error instanceof ReceiptUnknownError || error instanceof LegacyReceiptAmbiguousError);
@@ -648,8 +812,8 @@ for (const damaged of ["missing", "null", "number", "malformed", "other-hash", "
     const value = damaged === "null" ? null : damaged === "number" ? 123 : damaged === "malformed" ? "bad"
       : damaged === "promptVersion" ? "corrupted-version" : damaged === "temperature" ? 0.9
       : damaged === "maxTokens" ? 9999 : damaged === "userChars" ? 999999 : "f".repeat(64);
-    if (damaged === "missing") await sql`UPDATE receipts SET logical_key=${key}, request=request - ${field} WHERE id=${receiptId}`;
-    else await sql`UPDATE receipts SET logical_key=${key}, request=jsonb_set(request, ARRAY[${field}], ${sql.json(value)}::jsonb) WHERE id=${receiptId}`;
+    if (damaged === "missing") await sql`UPDATE receipts SET logical_key=${key}, request=request - 'identityV2' - ${field} WHERE id=${receiptId}`;
+    else await sql`UPDATE receipts SET logical_key=${key}, request=jsonb_set(request - 'identityV2', ARRAY[${field}], ${sql.json(value)}::jsonb) WHERE id=${receiptId}`;
     process.env.LLM_EXTRA_JSON = JSON.stringify(reordered);
     if (damaged === "userChars") {
       await assert.rejects(call(), (error: unknown) => {
@@ -693,7 +857,7 @@ test("a verified different old string identity does not block an independent req
   const key = logicalKeyFor({ service: "llm", model: "Ling-3.1-flash", purpose, attemptTag,
     identity: { model: "Ling-3.1-flash", promptVersion: "ling-v1", system: sha256(system), user: sha256(`input ${firstSubject}`),
       temperature: body.temperature, maxTokens: body.max_tokens, extra: original, bodyHash: sha256(JSON.stringify(body)) } });
-  await sql`UPDATE receipts SET logical_key=${key} WHERE id=${receiptId}`;
+  await sql`UPDATE receipts SET logical_key=${key},request=request - 'identityV2' WHERE id=${receiptId}`;
   await withStoppedLlmBudget(async () => {
     await assert.rejects(ask(secondSubject, { purpose, attemptTag, json: false }), BudgetExceededError);
   });
@@ -723,7 +887,7 @@ test("an exact authorized old Ling identity can retry its original receipt", asy
   const key = logicalKeyFor({ service: "llm", model: "Ling-3.1-flash", purpose, attemptTag,
     identity: { model: "Ling-3.1-flash", promptVersion: "ling-v1", system: sha256(system), user: sha256(`input ${subject}`),
       temperature: body.temperature, maxTokens: body.max_tokens, extra: null, bodyHash: sha256(JSON.stringify(body)) } });
-  await sql`UPDATE receipts SET logical_key=${key} WHERE id=${receiptId}`;
+  await sql`UPDATE receipts SET logical_key=${key},request=request - 'identityV2' WHERE id=${receiptId}`;
   await releaseReceipt(receiptId, { billed: false, note: "fixture exact identity" }, "ling-test");
   const quota = lingQuota(endpoint, process.env.LLM_API_KEY!, 85_000);
   await sql`UPDATE provider_quota_leases SET expires_at=now()-interval '1 second' WHERE quota_key=${quota.key}`;

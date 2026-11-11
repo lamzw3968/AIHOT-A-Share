@@ -24,7 +24,13 @@ export class BudgetExceededError extends Error {
 export class ReceiptBusyError extends Error {}
 
 /** A historical request may overlap, but its stored identity cannot prove it. */
-export class LegacyReceiptAmbiguousError extends Error {}
+export class LegacyReceiptAmbiguousError extends ProviderDeferredError {
+  constructor(message: string) {
+    super(new Date(Date.now() + 60_000));
+    this.name = "LegacyReceiptAmbiguousError";
+    this.message = message;
+  }
+}
 
 export class ReceiptUnknownError extends Error {
   readonly receiptId: number;
@@ -63,6 +69,7 @@ export interface ReceiptRequest {
   identity: unknown;
   /** During body-hash canonicalization, protect unresolved wire-hash keys and reuse exact old successes. */
   legacyBodyHashIdentity?: Record<string, unknown>;
+  legacyCanonicalIdentity?: Record<string, unknown>;
   legacyArrayUser?: boolean;
   /** Stored for diagnosis; must not contain secrets. */
   requestSummary?: Record<string, unknown>;
@@ -126,6 +133,9 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
   const claim = () => sql.begin(async (tx) => {
     // Serialise budget checks per service so concurrent workers cannot overshoot.
     await tx`SELECT pg_advisory_xact_lock(hashtext(${"budget:" + req.service}))`;
+    // Response persistence acquires quota before its receipt. Lock an existing quota row in the
+    // same order, even for a cache hit; a missing row needs no write until admission is required.
+    if (req.quota) await tx`SELECT quota_key FROM provider_quotas WHERE quota_key = ${req.quota.key} FOR UPDATE`;
     let [existing] = await tx<ReceiptRow[]>`
       SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE logical_key = ${logicalKey} FOR UPDATE`;
     if (req.legacyBodyHashIdentity) {
@@ -135,6 +145,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       const wireKey = typeof wireHash === "string"
         ? logicalKeyFor({ ...req, identity: { ...identity, bodyHash: wireHash } }) : null;
       const previousKey = logicalKeyFor({ ...req, identity });
+      const previousCanonicalKey = req.legacyCanonicalIdentity ? logicalKeyFor({ ...req, identity: req.legacyCanonicalIdentity }) : null;
       // Retain ambiguous old unknown attempts even after the receipt was released.
       const candidates = await tx<(ReceiptRow & { logical_key: string; request: Record<string, unknown> | null; authorized: boolean })[]>`
         SELECT r.id, r.status, r.response, r.error, r.created_at, r.updated_at, r.logical_key, r.request,
@@ -149,14 +160,20 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
           AND (r.status IN ('pending', 'unknown') OR
             (r.status = 'failed' AND (r.error LIKE ${LEGACY_AUTO_RELEASE_NOTE + "%"} OR
               EXISTS (SELECT 1 FROM receipt_attempts a WHERE a.receipt_id = r.id AND a.status = 'unknown'))))
-        ORDER BY r.id FOR UPDATE OF r`;
+        ORDER BY r.id`;
       let ambiguous: typeof candidates[number] | undefined;
       for (const row of candidates) {
         const prefix = [req.service, req.purpose, req.model ?? "-"].join(":") + ":";
         const suffix = row.logical_key.startsWith(prefix) ? row.logical_key.slice(prefix.length) : "";
         if (/^[0-9a-f]{64}:/.test(suffix) && suffix.slice(65) !== (req.attemptTag ?? "0")) continue;
-        const exactCurrent = row.logical_key === logicalKey || row.logical_key === wireKey || row.logical_key === previousKey;
+        const exactCurrent = row.logical_key === logicalKey || row.logical_key === wireKey || row.logical_key === previousKey || row.logical_key === previousCanonicalKey;
         const stored = row.request && typeof row.request === "object" && !Array.isArray(row.request) ? row.request : {};
+        // A version marker is not sufficient: verify the complete digest-only identity against
+        // the logical key before concluding that an unresolved request is independent.
+        const v2 = stored.identityV2;
+        const verifiedV2 = !!v2 && typeof v2 === "object" && !Array.isArray(v2) &&
+          (v2 as Record<string, unknown>).version === 2 && logicalKeyFor({ ...req, identity: v2 }) === row.logical_key;
+        if (verifiedV2 && row.logical_key !== logicalKey) continue;
         const validHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
         // Old summaries are unauthenticated. Reconstruct every identity field from the
         // summary before using any of them to prove a candidate is a different request.
@@ -174,12 +191,18 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
         if (!exactCurrent && differentVerifiedIdentity) continue;
         const sameOldFamily = verified && !differentVerifiedIdentity && stored.userHash === summary.userHash;
         if (row.status === "failed" && row.authorized && exactCurrent) {
-          if (!existing) existing = row;
+          if (!existing) {
+            const [locked] = await tx<ReceiptRow[]>`SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE id = ${row.id} FOR UPDATE`;
+            if (!locked || locked.status !== row.status || locked.updated_at.getTime() !== row.updated_at.getTime()) return { kind: "busy" as const, row };
+            existing = locked;
+          }
           continue;
         }
         if (sameOldFamily || exactCurrent) {
           if (row.status === "pending" && Date.now() - row.updated_at.getTime() < PENDING_STALE_MS) return { kind: "busy" as const, row };
           if (row.status === "pending" || (row.status === "failed" && row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
+            const [locked] = await tx<ReceiptRow[]>`SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE id = ${row.id} FOR UPDATE`;
+            if (!locked || locked.status !== row.status || locked.updated_at.getTime() !== row.updated_at.getTime()) return { kind: "busy" as const, row };
             await markUnknown(tx, row.id, "legacy body hash requires manual reconciliation and resend authorization");
           }
           if (row.status !== "failed" || row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE)) return { kind: "unknown" as const, row };
@@ -189,7 +212,7 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       if (ambiguous) return { kind: "ambiguous" as const, row: ambiguous };
       if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
       if (!existing || (existing.status === "failed" && !existing.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
-        for (const key of new Set([wireKey, previousKey])) {
+        for (const key of new Set([wireKey, previousKey, previousCanonicalKey])) {
           if (!key || key === logicalKey) continue;
           const [saved] = await tx<ReceiptRow[]>`
             SELECT id, status, response, error, created_at, updated_at FROM receipts
