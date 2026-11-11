@@ -93,6 +93,19 @@ export function logicalKeyFor(req: ReceiptRequest): string {
   return [req.service, req.purpose, req.model ?? "-", identity, req.attemptTag ?? "0"].join(":");
 }
 
+/** Only the digest-only identity generated for Ling can be stored as an unresolved request. */
+export function isLingIdentityV2(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  const keys = ["version", "model", "promptVersion", "system", "user", "temperature", "maxTokens", "extraHash", "bodyHash"];
+  if (Object.keys(v).length !== keys.length || keys.some((key) => !(key in v))) return false;
+  const digest = (x: unknown) => typeof x === "string" && /^[a-f0-9]{64}$/.test(x);
+  return v.version === 2 && typeof v.model === "string" && typeof v.promptVersion === "string" &&
+    digest(v.system) && digest(v.user) && digest(v.extraHash) && digest(v.bodyHash) &&
+    typeof v.temperature === "number" && Number.isFinite(v.temperature) &&
+    typeof v.maxTokens === "number" && Number.isSafeInteger(v.maxTokens) && v.maxTokens > 0;
+}
+
 interface ReceiptRow {
   id: number;
   status: string;
@@ -136,6 +149,16 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
     // Response persistence acquires quota before its receipt. Lock an existing quota row in the
     // same order, even for a cache hit; a missing row needs no write until admission is required.
     if (req.quota) await tx`SELECT quota_key FROM provider_quotas WHERE quota_key = ${req.quota.key} FOR UPDATE`;
+    const identityGrants: number[] = [];
+    const verifyGrants = async () => {
+      for (const id of identityGrants) {
+        const [valid] = await tx`SELECT c.id FROM receipt_identity_conflicts c JOIN receipts r ON r.id = c.receipt_id
+          WHERE c.id = ${id} AND c.state = 'authorized' AND c.expires_at > clock_timestamp()
+            AND r.logical_key = c.receipt_key AND r.attempts = c.receipt_attempts
+            AND r.request->>'bodyHash' = c.receipt_wire_hash`;
+        if (!valid) throw new LegacyReceiptAmbiguousError("Identity review expired or the historical receipt changed before admission");
+      }
+    };
     let [existing] = await tx<ReceiptRow[]>`
       SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE logical_key = ${logicalKey} FOR UPDATE`;
     if (req.legacyBodyHashIdentity) {
@@ -147,8 +170,8 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       const previousKey = logicalKeyFor({ ...req, identity });
       const previousCanonicalKey = req.legacyCanonicalIdentity ? logicalKeyFor({ ...req, identity: req.legacyCanonicalIdentity }) : null;
       // Retain ambiguous old unknown attempts even after the receipt was released.
-      const candidates = await tx<(ReceiptRow & { logical_key: string; request: Record<string, unknown> | null; authorized: boolean })[]>`
-        SELECT r.id, r.status, r.response, r.error, r.created_at, r.updated_at, r.logical_key, r.request,
+      const candidates = await tx<(ReceiptRow & { logical_key: string; request: Record<string, unknown> | null; attempts: number; authorized: boolean })[]>`
+        SELECT r.id, r.status, r.response, r.error, r.created_at, r.updated_at, r.logical_key, r.request, r.attempts,
           EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'receipt.release' AND a.subject = 'receipt:' || r.id
             AND a.actor <> 'ops.recover' AND a.before->>'status' = 'unknown'
             AND a.after->>'status' = 'failed' AND a.after->>'resendAuthorized' = 'true'
@@ -174,6 +197,15 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
         const verifiedV2 = !!v2 && typeof v2 === "object" && !Array.isArray(v2) &&
           (v2 as Record<string, unknown>).version === 2 && logicalKeyFor({ ...req, identity: v2 }) === row.logical_key;
         if (verifiedV2 && row.logical_key !== logicalKey) continue;
+        // A grant applies only to the exact observed A/B pair and only while the A snapshot and
+        // expiry still match. Budget advisory lock serializes claim with authorization/revocation.
+        if (!exactCurrent && isLingIdentityV2(req.identity) && typeof stored.bodyHash === "string") {
+          const [grant] = await tx<{ id: number }[]>`SELECT id FROM receipt_identity_conflicts
+            WHERE receipt_id = ${row.id} AND receipt_key = ${row.logical_key} AND receipt_wire_hash = ${stored.bodyHash}
+              AND receipt_attempts = ${row.attempts} AND request_key = ${logicalKey}
+              AND request_identity = ${tx.json(req.identity as never)} AND state = 'authorized' AND expires_at > clock_timestamp()`;
+          if (grant) { identityGrants.push(grant.id); continue; }
+        }
         const validHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
         // Old summaries are unauthenticated. Reconstruct every identity field from the
         // summary before using any of them to prove a candidate is a different request.
@@ -209,7 +241,19 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
         }
         ambiguous ??= row;
       }
-      if (ambiguous) return { kind: "ambiguous" as const, row: ambiguous };
+      if (ambiguous) {
+        const old = ambiguous.request && typeof ambiguous.request === "object" && !Array.isArray(ambiguous.request) ? ambiguous.request : {};
+        if (isLingIdentityV2(req.identity) && typeof old.bodyHash === "string" && /^[a-f0-9]{64}$/.test(old.bodyHash)) {
+          // No HTTP, receipt or paid attempt has been created. Retain only hashed B identity.
+          await tx`INSERT INTO receipt_identity_conflicts
+            (receipt_id, receipt_key, receipt_wire_hash, receipt_attempts, request_key, request_identity, request_tag)
+            VALUES (${ambiguous.id}, ${ambiguous.logical_key}, ${old.bodyHash}, ${ambiguous.attempts},
+              ${logicalKey}, ${tx.json(req.identity as never)}, ${req.attemptTag ?? "0"})
+            ON CONFLICT (receipt_id, receipt_key, receipt_wire_hash, receipt_attempts, request_key)
+            DO UPDATE SET updated_at = now()`;
+        }
+        return { kind: "ambiguous" as const, row: ambiguous };
+      }
       if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
       if (!existing || (existing.status === "failed" && !existing.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
         for (const key of new Set([wireKey, previousKey, previousCanonicalKey])) {
@@ -240,19 +284,25 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       // failed: the provider did not take the request, or its answer was unusable; a new attempt is allowed.
       await checkBudget(tx, req.service);
       const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
+      await verifyGrants();
       const [r] = await tx<{ attempts: number }[]>`
         UPDATE receipts SET status = 'pending', attempts = attempts + 1, error = NULL, updated_at = now() WHERE id = ${existing.id} RETURNING attempts`;
       const attemptId = await startAttempt(tx, existing.id, r!.attempts, req);
+      // Recheck after writes: a blocked insert must not consume an authorization that expired
+      // while waiting for a database lock. A failure rolls the reservation and lease back.
+      await verifyGrants();
       return { kind: "call" as const, id: existing.id, attemptId, leaseId };
     }
     await checkBudget(tx, req.service);
     const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
+    await verifyGrants();
     const [row] = await tx<{ id: number }[]>`
       INSERT INTO receipts (logical_key, service, model, purpose, subject, status, request, attempts)
       VALUES (${logicalKey}, ${req.service}, ${req.model ?? null}, ${req.purpose}, ${req.subject ?? null}, 'pending',
               ${tx.json((req.requestSummary ?? {}) as never)}, 1)
       RETURNING id`;
     const attemptId = await startAttempt(tx, row!.id, 1, req);
+    await verifyGrants();
     return { kind: "call" as const, id: row!.id, attemptId, leaseId };
   });
 
