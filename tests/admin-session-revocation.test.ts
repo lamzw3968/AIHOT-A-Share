@@ -1,3 +1,4 @@
+import { listenAppForFetch } from "./http-fixture.ts";
 import { gate, stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -90,7 +91,7 @@ async function bindingColumns() {
 
 before(async () => {
   existingUsers = new Set((await sql<{ id: number }[]>`SELECT id FROM admin_users`).map((u) => Number(u.id)));
-  base = await app.listen({ host: "127.0.0.1", port: 0 });
+  base = await listenAppForFetch(app);
 });
 beforeEach(() => {
   config.adminPassword = PASSWORD_A;

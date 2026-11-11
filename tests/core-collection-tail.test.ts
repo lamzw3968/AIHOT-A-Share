@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // 普通采集必须处理已返回列表的尾部；首次回灌、详情预算和成功游标仍遵守原有边界。
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -46,7 +47,7 @@ const server = http.createServer((req, res) => {
       `<item><title>${escape(i.title)}</title><link>${escape(i.url)}</link>${i.date ? `<pubDate>${new Date(i.date).toUTCString()}</pubDate>` : ""}<description>${escape(i.summary)}</description><category>${escape(i.category ?? "keep")}</category></item>`).join("")}</channel></rss>`);
   }
 });
-await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 config.allowPrivateNetworkFetch = true;
 after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); await stopBoss(); await closeDb(); });

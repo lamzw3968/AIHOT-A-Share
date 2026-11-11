@@ -1,3 +1,4 @@
+import { listenAppForFetch } from "./http-fixture.ts";
 import "./setup.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -7,7 +8,7 @@ import { registerMcp } from "../apps/api/src/routes/mcp.ts";
 test("closing the API drains a live MCP subscription before closing HTTP", { timeout: 5000 }, async () => {
   const app = Fastify();
   registerMcp(app);
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = await listenAppForFetch(app);
   const response = await fetch(`${address}/api/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": "subscriptions/listen" },

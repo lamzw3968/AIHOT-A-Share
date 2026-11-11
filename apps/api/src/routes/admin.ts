@@ -17,6 +17,7 @@ import { navCounts } from "@aihot/backend/admin/navigation";
 import { listAudit } from "@aihot/backend/audit";
 import { detachFromFact, mergeStories } from "@aihot/backend/events/corrections";
 import { releaseReceipt } from "@aihot/backend/operations/recover";
+import { authorizeReceiptIdentityConflict, listReceiptIdentityConflicts, revokeReceiptIdentityConflict } from "@aihot/backend/operations/receipt-identity";
 import { resolveDelivery } from "@aihot/backend/notify/deliver";
 import { sendProblem } from "../http/respond.ts";
 import { adminHandler } from "./admin-auth.ts";
@@ -92,6 +93,9 @@ export function registerAdmin(app: FastifyInstance) {
   // Runs (F20)
   app.get("/api/admin/runs", adminHandler(async () => runsOverview()));
   app.post("/api/admin/receipts/:id/release", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await releaseReceipt(Number(param(req, "id")), body(req) as never, actorOf(admin)))));
+  app.get("/api/admin/receipt-identity-conflicts", adminHandler(async () => listReceiptIdentityConflicts()));
+  app.post("/api/admin/receipt-identity-conflicts/:id/authorize", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await authorizeReceiptIdentityConflict(Number(param(req, "id")), body(req) as never, actorOf(admin)))));
+  app.post("/api/admin/receipt-identity-conflicts/:id/revoke", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await revokeReceiptIdentityConflict(Number(param(req, "id")), body(req) as never, actorOf(admin)))));
   app.post("/api/admin/deliveries/:id/resolve", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await resolveDelivery(Number(param(req, "id")), body(req) as never, actorOf(admin)))));
   app.post("/api/admin/processing/requeue", adminHandler(async (req, _reply, admin) => requeueFailedArticles(body(req) as never, actorOf(admin))));
 

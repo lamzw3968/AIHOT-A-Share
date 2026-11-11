@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Atom XHTML constructs must keep their mixed text/element order before the usual HTML cleaning.
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -19,7 +20,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("content-type", "application/atom+xml");
   res.end(`<feed xmlns="http://www.w3.org/2005/Atom"><id>urn:test:feed</id><title>Test</title><updated>2026-09-29T00:00:00Z</updated><author><name>Test</name></author><entry><id>urn:test:entry</id><updated>2026-09-29T00:00:00Z</updated><link href="https://example.org/article"/>${pages[req.url!]}</entry></feed>`);
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const previousPrivateFetch = config.allowPrivateNetworkFetch;
 config.allowPrivateNetworkFetch = true;
 after(async () => {

@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Fixed, fictional feeds and a loopback provider: this proves material/queue contracts, not model quality.
 import { stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -32,7 +33,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(fixture ? 200 : 404, { "content-type": fixture?.type ?? "text/plain" });
   res.end(fixture?.body ?? "No fixture");
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+await listenForFetch(server);
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 const oldPrivate = config.allowPrivateNetworkFetch;
 config.allowPrivateNetworkFetch = true; // Only this isolated test process may fetch its loopback fixtures.

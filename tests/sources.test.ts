@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // Listing parsers on the page shapes Jina returns for real sites: card links that wrap
 // an image, a title attribute, http links under https prefixes, and navigation that is no post. Also
 // what made articles flip between versions: in-page anchors of an HTML listing and
@@ -72,7 +73,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(found ? 200 : 404, { "content-type": path.endsWith(".js") ? "application/javascript" : "text/html; charset=utf-8" });
   res.end(found ? pages[path]!(`${site}/cdn/`) : "");
 });
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+await listenForFetch(server);
 const site = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 config.allowPrivateNetworkFetch = true;
 after(() => new Promise<void>((resolve) => server.close(() => resolve())));

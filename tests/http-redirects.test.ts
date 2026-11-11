@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // 重定向测试只使用虚构凭据和回环服务；HTTPS 分支使用禁止联网的传输替身。
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -9,6 +10,7 @@ import { guardedFetch } from "@aihot/backend/lib/http-fetch";
 import { fetchJsonList } from "@aihot/backend/sources/json-list";
 import type { SourceRow } from "@aihot/backend/sources/types";
 import { mpArticle } from "@aihot/backend/providers/dajiala";
+import { ReceiptUnknownError } from "@aihot/backend/providers/receipts";
 import { closeDb, sql } from "@aihot/backend/db";
 
 interface Hit { method: string; url: string; headers: http.IncomingHttpHeaders; body: string }
@@ -25,7 +27,7 @@ async function fixture() {
     if (route) await route(hit, res);
     else { res.writeHead(200, { "content-type": "application/json" }); res.end('{"code":0,"title":"fixture","content":"fixture"}'); }
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  await listenForFetch(server);
   return { hits, routes, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 const a = await fixture();
@@ -164,8 +166,17 @@ test("Dajiala query credentials use the restricted policy through real receipt h
   process.env.DAJIALA_BASE_URL = a.url; process.env.DAJIALA_KEY = key;
   a.routes.set("/fbmain/monitor/v3/article_detail", (hit, res) => { res.writeHead(302, { location: b.url + "/provider" + new URL(hit.url, a.url).search }); res.end(); });
   const count = b.hits.length;
-  await assert.rejects(mpArticle("https://example.org/fixture", { subject: key, identity: key }), /redirect/i);
+  let receiptId = 0;
+  await assert.rejects(mpArticle("https://example.org/fixture", { subject: key, identity: key }), (error) => {
+    assert.ok(error instanceof ReceiptUnknownError);
+    receiptId = error.receiptId;
+    assert.ok(!String(error).includes(key), "query credentials are not exposed in the error");
+    return true;
+  });
   assert.equal(b.hits.length, count);
+  const [receipt] = await sql`SELECT status, error FROM receipts WHERE id = ${receiptId}`;
+  assert.equal(receipt!.status, "unknown");
+  assert.ok(!receipt!.error.includes(key), "unknown receipt diagnostics contain no query credentials");
 });
 
 test("opaque JSON and Dajiala query callers retain same-origin redirects", async () => {

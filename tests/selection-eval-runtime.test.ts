@@ -42,7 +42,7 @@ interface Result {
   cases: Array<{ caseId: string; decision: string | null; error: string | null }>;
 }
 
-async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: string }, opts: { split?: string } = {}): Promise<Result> {
+async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: string }, opts: { split?: string; defaultDataDir?: boolean } = {}): Promise<Result> {
   const dir = mkdtempSync(path.join(tmpdir(), "selection-eval-"));
   let reportPath: string | undefined;
   try {
@@ -51,10 +51,12 @@ async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: 
     const args = ["scripts/eval-selection.ts", "--gold", gold, "--concurrency", "6", "--no-import"];
     if (opts.split) args.push("--split", opts.split);
     const started = performance.now();
+    const env = { ...process.env, AIHOT_DATA_DIR: path.join(dir, "data") };
+    if (opts.defaultDataDir) delete (env as NodeJS.ProcessEnv).AIHOT_DATA_DIR;
     const { stdout } = await exec(process.execPath, args, {
       cwd: REPO_ROOT,
       env: {
-        ...process.env,
+        ...env,
         MODEL_CALLS_ENABLED: "true",
         SCORE_MODEL: "glm-5.3-flash-selection",
         PREFILTER_MODEL: "qwen3.7-flash",
@@ -68,6 +70,7 @@ async function evaluate(rows: GoldRow[], providers: { prefilter: string; score: 
     const elapsedSeconds = (performance.now() - started) / 1000;
     reportPath = stdout.split("\n").find((line) => line.startsWith("report: "))?.slice(8);
     assert.ok(reportPath, stdout);
+    assert.equal(path.dirname(reportPath), path.join(opts.defaultDataDir ? path.join(REPO_ROOT, ".data") : env.AIHOT_DATA_DIR, "eval"));
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as {
       meta: { split: string; promptVersion: string };
       models: Record<string, { summary: Result["summary"]; cases: Result["cases"] }>;
@@ -175,7 +178,7 @@ test("custom split names cannot escape the evaluation output directory", async (
 
     const marker = tag();
     const split = "../../../../outside";
-    const result = await evaluate([row(`${marker}-blocked`, marker, "T1", "reject", split)], { prefilter: prefilter.url, score: score.url }, { split });
+    const result = await evaluate([row(`${marker}-blocked`, marker, "T1", "reject", split)], { prefilter: prefilter.url, score: score.url }, { split, defaultDataDir: true });
     assert.equal(path.dirname(result.reportPath), path.join(REPO_ROOT, ".data/eval"));
     assert.ok(path.basename(result.reportPath).startsWith("selection-outside-1-"));
     assert.equal(result.meta.split, split, "metadata keeps the original user-supplied split");

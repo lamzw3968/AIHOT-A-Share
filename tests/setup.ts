@@ -5,6 +5,7 @@
 // one database and its paid-service budgets, so they run one at a time (package.json).
 import http from "node:http";
 import { Agent, buildConnector, setGlobalDispatcher } from "undici";
+import { listenForFetch } from "./http-fixture.ts";
 
 const database = new URL(process.env.DATABASE_URL ?? "postgres://unset/unset").pathname.slice(1);
 if (!/_(test|ci)$/.test(database)) {
@@ -21,9 +22,9 @@ process.env.LOG_LEVEL ??= "error";
 // Model tests exercise the real receipt path against local stubs only. Remove inherited credentials
 // before modules load, and refuse real network connections even when a test enables a provider.
 for (const name of Object.keys(process.env)) {
-  if (name.endsWith("_API_KEY") || ["DAJIALA_KEY", "FEISHU_APP_SECRET", "INGEST_TOKEN", "LLM_EXTRA_JSON", "EGRESS_PROXY_URL"].includes(name)) delete process.env[name];
+  if (name.endsWith("_API_KEY") || name.startsWith("ANT_LING_") || ["DAJIALA_KEY", "FEISHU_APP_SECRET", "INGEST_TOKEN", "LLM_EXTRA_JSON", "LLM_PROVIDER", "EGRESS_PROXY_URL"].includes(name)) delete process.env[name];
 }
-for (const name of ["LLM", "ZHIPU", "DEEPSEEK", "DASHSCOPE", "XIAOMI_MIMO", "EMBEDDING", "JINA", "SOCIALDATA", "DAJIALA"]) {
+for (const name of ["LLM", "ANT_LING", "ZHIPU", "DEEPSEEK", "DASHSCOPE", "XIAOMI_MIMO", "EMBEDDING", "JINA", "SOCIALDATA", "DAJIALA"]) {
   process.env[`${name}_BASE_URL`] = "http://127.0.0.1:9/v1";
 }
 process.env.MODEL_CALLS_ENABLED = "true";
@@ -63,7 +64,7 @@ export async function stub(answer: (hit: number, req: { url: string; body: strin
       res.end(JSON.stringify(reply.json));
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await listenForFetch(server);
   const { port } = server.address() as { port: number };
   return { url: `http://127.0.0.1:${port}`, hits: () => hits, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }

@@ -2,7 +2,8 @@
 import type { PgBoss } from "pg-boss";
 import { FEATURES } from "@aihot/industry/features";
 import { credential } from "@aihot/backend/config";
-import { ensureQueue, recordRun } from "@aihot/backend/jobs/queue";
+import { ensureQueue, getBoss, recordRun } from "@aihot/backend/jobs/queue";
+import { resumeDeferredProviderJobs, runProviderAwareJob } from "@aihot/backend/jobs/provider-deferred";
 import { sweepUnprocessed } from "@aihot/backend/jobs/content";
 import { translatePending } from "@aihot/backend/editorial/translate";
 import { adaptIntervals, scheduleDueSources } from "@aihot/backend/sources/collect";
@@ -27,13 +28,14 @@ import { sourceHealthWeekly } from "@aihot/backend/operations/reports";
 interface Scheduled {
   name: string;
   cron: string;
-  run: () => Promise<unknown>;
+  run: (scheduledAt?: Date) => Promise<unknown>;
   missed?: "skip" | "once";
 }
 
 const collecting = process.env.COLLECT_ENABLED !== "false";
 
 export const SCHEDULES: Scheduled[] = [
+  { name: "providers.resume", cron: "* * * * *", run: async () => resumeDeferredProviderJobs(await getBoss()) },
   { name: "content.sweep", cron: "*/5 * * * *", run: sweepUnprocessed },
   // Full-text translations of newly selected items (model calls; off with MODEL_CALLS_ENABLED=false).
   { name: "content.translate", cron: "*/5 * * * *", run: () => translatePending() },
@@ -42,15 +44,15 @@ export const SCHEDULES: Scheduled[] = [
   { name: "hot.snapshot", cron: "2 * * * *", run: () => snapshotHeat() },
   { name: "stories.status", cron: "7 * * * *", run: refreshStoryStatuses },
   { name: "stories.links", cron: "12 * * * *", run: linkRelatedStories },
-  { name: "reports.daily", cron: "0 8 * * *", missed: "once", run: () => composeDaily(dueDaily()) },
-  { name: "reports.weekly", cron: "0 10 * * 1", missed: "once", run: () => composeWeekly(dueWeekly()) },
+  { name: "reports.daily", cron: "0 8 * * *", missed: "once", run: (scheduledAt) => composeDaily(dueDaily(scheduledAt)) },
+  { name: "reports.weekly", cron: "0 10 * * 1", missed: "once", run: (scheduledAt) => composeWeekly(dueWeekly(scheduledAt)) },
   {
     name: "reports.monthly",
     cron: "30 10 1 * *",
     missed: "once",
-    run: () => composeMonthly(dueMonthly()),
+    run: (scheduledAt) => composeMonthly(dueMonthly(scheduledAt)),
   },
-  { name: "reports.catch-up", cron: "15 * * * *", run: () => catchUpReports() },
+  { name: "reports.catch-up", cron: "15 * * * *", run: (scheduledAt) => catchUpReports(scheduledAt) },
   { name: "ops.retention", cron: "30 3 * * *", missed: "once", run: () => dailyRetention() },
   { name: "sources.icons", cron: "40 4 * * *", missed: "once", run: () => refreshSourceIcons() },
   // IndexNow for new indexable pages (off unless INDEXNOW_SUBMIT_ENABLED).
@@ -98,7 +100,8 @@ export async function registerSchedules(boss: PgBoss) {
     await ensureQueue(queue, { policy: "singleton", retryLimit: 1, expireInSeconds: 3600 });
     await boss.schedule(queue, s.cron, {}, { tz: "Asia/Shanghai", missed: s.missed ?? "skip" });
     // Schedules fire at minute boundaries; a 15 s pickup keeps them on time with a third of the polling.
-    await boss.work(queue, { pollingIntervalSeconds: 15 }, async () => recordRun(s.name, s.run));
+    await boss.work(queue, { pollingIntervalSeconds: 15, includeMetadata: true }, async ([job]) =>
+      job ? recordRun(s.name, () => runProviderAwareJob(boss, job, (scheduledAt) => s.run(scheduledAt))) : undefined);
   }
   // A schedule removed from the table (a module switched off) must not keep firing from an earlier run.
   const names = new Set(SCHEDULES.map((s) => `cron.${s.name}`));

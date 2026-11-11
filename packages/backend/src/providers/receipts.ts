@@ -4,11 +4,12 @@
 // 2. Before calling, a placeholder row and an attempt row are persisted; budgets count attempts.
 // 3. The raw response is saved before any business write; recovery reuses a received response.
 // 4. A request whose outcome is unknown (timeout after sending, crash mid-flight) is not re-sent by the
-//    caller. ops.recover releases it once after 30 minutes (operations/recover.ts), so a lost answer
-//    costs at most one repeat; after that it waits for the admin.
+//    caller. Only an audited admin release after reconciliation authorizes another attempt.
 import { sql, type Db } from "../db.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import { claimProviderQuota, coolDownProviderQuota, finishProviderQuota, ProviderDeferredError, type ProviderQuota } from "./provider-quotas.ts";
 
 export class BudgetExceededError extends Error {
   readonly service: string;
@@ -22,6 +23,15 @@ export class BudgetExceededError extends Error {
 
 export class ReceiptBusyError extends Error {}
 
+/** A historical request may overlap, but its stored identity cannot prove it. */
+export class LegacyReceiptAmbiguousError extends ProviderDeferredError {
+  constructor(message: string) {
+    super(new Date(Date.now() + 60_000));
+    this.name = "LegacyReceiptAmbiguousError";
+    this.message = message;
+  }
+}
+
 export class ReceiptUnknownError extends Error {
   readonly receiptId: number;
   constructor(receiptId: number, message: string) {
@@ -34,10 +44,12 @@ export class ReceiptUnknownError extends Error {
 export class ProviderRejectedError extends Error {
   readonly status: number | null;
   readonly retryable: boolean;
-  constructor(message: string, status: number | null, retryable: boolean) {
+  retryAfterSeconds?: number;
+  constructor(message: string, status: number | null, retryable: boolean, retryAfterSeconds?: number) {
     super(message);
     this.status = status;
     this.retryable = retryable;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -55,10 +67,16 @@ export interface ReceiptRequest {
   subject?: string | null;
   /** Everything that determines the output. Hashed into the logical key; only a redacted summary is stored. */
   identity: unknown;
+  /** During body-hash canonicalization, protect unresolved wire-hash keys and reuse exact old successes. */
+  legacyBodyHashIdentity?: Record<string, unknown>;
+  legacyCanonicalIdentity?: Record<string, unknown>;
+  legacyArrayUser?: boolean;
   /** Stored for diagnosis; must not contain secrets. */
   requestSummary?: Record<string, unknown>;
   /** Distinguishes an explicit re-run (e.g. admin "re-evaluate") from recovery of the same request. */
   attemptTag?: string;
+  /** Admission policy, deliberately outside logical identity and stored request summaries. */
+  quota?: ProviderQuota;
 }
 
 export interface ReceiptResult {
@@ -68,16 +86,31 @@ export interface ReceiptResult {
 }
 
 const PENDING_STALE_MS = 10 * 60 * 1000;
+const LEGACY_AUTO_RELEASE_NOTE = "自动放行：结果未知超过 30 分钟，未核对是否计费";
 
 export function logicalKeyFor(req: ReceiptRequest): string {
   const identity = sha256(stableJson(req.identity));
   return [req.service, req.purpose, req.model ?? "-", identity, req.attemptTag ?? "0"].join(":");
 }
 
+/** Only the digest-only identity generated for Ling can be stored as an unresolved request. */
+export function isLingIdentityV2(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  const keys = ["version", "model", "promptVersion", "system", "user", "temperature", "maxTokens", "extraHash", "bodyHash"];
+  if (Object.keys(v).length !== keys.length || keys.some((key) => !(key in v))) return false;
+  const digest = (x: unknown) => typeof x === "string" && /^[a-f0-9]{64}$/.test(x);
+  return v.version === 2 && typeof v.model === "string" && typeof v.promptVersion === "string" &&
+    digest(v.system) && digest(v.user) && digest(v.extraHash) && digest(v.bodyHash) &&
+    typeof v.temperature === "number" && Number.isFinite(v.temperature) &&
+    typeof v.maxTokens === "number" && Number.isSafeInteger(v.maxTokens) && v.maxTokens > 0;
+}
+
 interface ReceiptRow {
   id: number;
   status: string;
   response: unknown;
+  error: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -110,16 +143,138 @@ async function checkBudget(tx: Db, service: string): Promise<void> {
 export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallOutcome>): Promise<ReceiptResult> {
   const logicalKey = logicalKeyFor(req);
 
-  const claimed = await sql.begin(async (tx) => {
+  const claim = () => sql.begin(async (tx) => {
     // Serialise budget checks per service so concurrent workers cannot overshoot.
     await tx`SELECT pg_advisory_xact_lock(hashtext(${"budget:" + req.service}))`;
-    const [existing] = await tx<ReceiptRow[]>`
-      SELECT id, status, response, created_at, updated_at FROM receipts WHERE logical_key = ${logicalKey} FOR UPDATE`;
+    // Response persistence acquires quota before its receipt. Lock an existing quota row in the
+    // same order, even for a cache hit; a missing row needs no write until admission is required.
+    if (req.quota) await tx`SELECT quota_key FROM provider_quotas WHERE quota_key = ${req.quota.key} FOR UPDATE`;
+    const identityGrants: number[] = [];
+    const verifyGrants = async () => {
+      for (const id of identityGrants) {
+        const [valid] = await tx`SELECT c.id FROM receipt_identity_conflicts c JOIN receipts r ON r.id = c.receipt_id
+          WHERE c.id = ${id} AND c.state = 'authorized' AND c.expires_at > clock_timestamp()
+            AND r.logical_key = c.receipt_key AND r.attempts = c.receipt_attempts
+            AND r.request->>'bodyHash' = c.receipt_wire_hash`;
+        if (!valid) throw new LegacyReceiptAmbiguousError("Identity review expired or the historical receipt changed before admission");
+      }
+    };
+    let [existing] = await tx<ReceiptRow[]>`
+      SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE logical_key = ${logicalKey} FOR UPDATE`;
+    if (req.legacyBodyHashIdentity) {
+      const identity = req.legacyBodyHashIdentity;
+      const summary = req.requestSummary ?? {};
+      const wireHash = summary.bodyHash;
+      const wireKey = typeof wireHash === "string"
+        ? logicalKeyFor({ ...req, identity: { ...identity, bodyHash: wireHash } }) : null;
+      const previousKey = logicalKeyFor({ ...req, identity });
+      const previousCanonicalKey = req.legacyCanonicalIdentity ? logicalKeyFor({ ...req, identity: req.legacyCanonicalIdentity }) : null;
+      // Retain ambiguous old unknown attempts even after the receipt was released.
+      const candidates = await tx<(ReceiptRow & { logical_key: string; request: Record<string, unknown> | null; attempts: number; authorized: boolean })[]>`
+        SELECT r.id, r.status, r.response, r.error, r.created_at, r.updated_at, r.logical_key, r.request, r.attempts,
+          EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'receipt.release' AND a.subject = 'receipt:' || r.id
+            AND a.actor <> 'ops.recover' AND a.before->>'status' = 'unknown'
+            AND a.after->>'status' = 'failed' AND a.after->>'resendAuthorized' = 'true'
+            AND jsonb_typeof(a.after->'billed') = 'boolean'
+            AND a.created_at >= (SELECT max(x.finished_at) FROM receipt_attempts x WHERE x.receipt_id = r.id AND x.status = 'unknown')) AS authorized
+        FROM receipts r
+        WHERE r.service = ${req.service} AND r.model IS NOT DISTINCT FROM ${req.model ?? null}
+          AND r.purpose = ${req.purpose}
+          AND (r.status IN ('pending', 'unknown') OR
+            (r.status = 'failed' AND (r.error LIKE ${LEGACY_AUTO_RELEASE_NOTE + "%"} OR
+              EXISTS (SELECT 1 FROM receipt_attempts a WHERE a.receipt_id = r.id AND a.status = 'unknown'))))
+        ORDER BY r.id`;
+      let ambiguous: typeof candidates[number] | undefined;
+      for (const row of candidates) {
+        const prefix = [req.service, req.purpose, req.model ?? "-"].join(":") + ":";
+        const suffix = row.logical_key.startsWith(prefix) ? row.logical_key.slice(prefix.length) : "";
+        if (/^[0-9a-f]{64}:/.test(suffix) && suffix.slice(65) !== (req.attemptTag ?? "0")) continue;
+        const exactCurrent = row.logical_key === logicalKey || row.logical_key === wireKey || row.logical_key === previousKey || row.logical_key === previousCanonicalKey;
+        const stored = row.request && typeof row.request === "object" && !Array.isArray(row.request) ? row.request : {};
+        // A version marker is not sufficient: verify the complete digest-only identity against
+        // the logical key before concluding that an unresolved request is independent.
+        const v2 = stored.identityV2;
+        const verifiedV2 = !!v2 && typeof v2 === "object" && !Array.isArray(v2) &&
+          (v2 as Record<string, unknown>).version === 2 && logicalKeyFor({ ...req, identity: v2 }) === row.logical_key;
+        if (verifiedV2 && row.logical_key !== logicalKey) continue;
+        // A grant applies only to the exact observed A/B pair and only while the A snapshot and
+        // expiry still match. Budget advisory lock serializes claim with authorization/revocation.
+        if (!exactCurrent && isLingIdentityV2(req.identity) && typeof stored.bodyHash === "string") {
+          const [grant] = await tx<{ id: number }[]>`SELECT id FROM receipt_identity_conflicts
+            WHERE receipt_id = ${row.id} AND receipt_key = ${row.logical_key} AND receipt_wire_hash = ${stored.bodyHash}
+              AND receipt_attempts = ${row.attempts} AND request_key = ${logicalKey}
+              AND request_identity = ${tx.json(req.identity as never)} AND state = 'authorized' AND expires_at > clock_timestamp()`;
+          if (grant) { identityGrants.push(grant.id); continue; }
+        }
+        const validHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+        // Old summaries are unauthenticated. Reconstruct every identity field from the
+        // summary before using any of them to prove a candidate is a different request.
+        const recordedKey = typeof stored.promptVersion === "string" && validHash(stored.systemHash) &&
+          validHash(stored.userHash) && validHash(stored.bodyHash) &&
+          typeof stored.temperature === "number" && typeof stored.maxTokens === "number"
+          ? logicalKeyFor({ ...req, identity: { ...identity, promptVersion: stored.promptVersion,
+              system: stored.systemHash, user: stored.userHash, temperature: stored.temperature,
+              maxTokens: stored.maxTokens, bodyHash: stored.bodyHash } }) : null;
+        const verified = recordedKey === row.logical_key;
+        const differentVerifiedIdentity = verified && (
+          stored.promptVersion !== identity.promptVersion || stored.systemHash !== identity.system ||
+          stored.temperature !== identity.temperature || stored.maxTokens !== identity.maxTokens ||
+          (!req.legacyArrayUser && stored.userHash !== summary.userHash));
+        if (!exactCurrent && differentVerifiedIdentity) continue;
+        const sameOldFamily = verified && !differentVerifiedIdentity && stored.userHash === summary.userHash;
+        if (row.status === "failed" && row.authorized && exactCurrent) {
+          if (!existing) {
+            const [locked] = await tx<ReceiptRow[]>`SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE id = ${row.id} FOR UPDATE`;
+            if (!locked || locked.status !== row.status || locked.updated_at.getTime() !== row.updated_at.getTime()) return { kind: "busy" as const, row };
+            existing = locked;
+          }
+          continue;
+        }
+        if (sameOldFamily || exactCurrent) {
+          if (row.status === "pending" && Date.now() - row.updated_at.getTime() < PENDING_STALE_MS) return { kind: "busy" as const, row };
+          if (row.status === "pending" || (row.status === "failed" && row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
+            const [locked] = await tx<ReceiptRow[]>`SELECT id, status, response, error, created_at, updated_at FROM receipts WHERE id = ${row.id} FOR UPDATE`;
+            if (!locked || locked.status !== row.status || locked.updated_at.getTime() !== row.updated_at.getTime()) return { kind: "busy" as const, row };
+            await markUnknown(tx, row.id, "legacy body hash requires manual reconciliation and resend authorization");
+          }
+          if (row.status !== "failed" || row.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE)) return { kind: "unknown" as const, row };
+        }
+        ambiguous ??= row;
+      }
+      if (ambiguous) {
+        const old = ambiguous.request && typeof ambiguous.request === "object" && !Array.isArray(ambiguous.request) ? ambiguous.request : {};
+        if (isLingIdentityV2(req.identity) && typeof old.bodyHash === "string" && /^[a-f0-9]{64}$/.test(old.bodyHash)) {
+          // No HTTP, receipt or paid attempt has been created. Retain only hashed B identity.
+          await tx`INSERT INTO receipt_identity_conflicts
+            (receipt_id, receipt_key, receipt_wire_hash, receipt_attempts, request_key, request_identity, request_tag)
+            VALUES (${ambiguous.id}, ${ambiguous.logical_key}, ${old.bodyHash}, ${ambiguous.attempts},
+              ${logicalKey}, ${tx.json(req.identity as never)}, ${req.attemptTag ?? "0"})
+            ON CONFLICT (receipt_id, receipt_key, receipt_wire_hash, receipt_attempts, request_key)
+            DO UPDATE SET updated_at = now()`;
+        }
+        return { kind: "ambiguous" as const, row: ambiguous };
+      }
+      if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
+      if (!existing || (existing.status === "failed" && !existing.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE))) {
+        for (const key of new Set([wireKey, previousKey, previousCanonicalKey])) {
+          if (!key || key === logicalKey) continue;
+          const [saved] = await tx<ReceiptRow[]>`
+            SELECT id, status, response, error, created_at, updated_at FROM receipts
+            WHERE logical_key = ${key} AND status IN ('received', 'completed') FOR UPDATE`;
+          if (saved) return { kind: "reuse" as const, row: saved };
+        }
+      }
+    }
     if (existing?.status === "received" || existing?.status === "completed") return { kind: "reuse" as const, row: existing };
-    // Finish business writes from saved answers during shutdown, but never reserve or send the
-    // next paid page/batch. An answer already in flight still saves below, without this check.
+    // Saved results may finish during shutdown, but no new request may be reserved.
     shutdownSignal.signal.throwIfAborted();
     if (existing) {
+      // Upgraded workers may pick up work queued by the old timed release. That release is not
+      // authorization, even though it already changed the receipt to failed. Preserve its history.
+      if (existing.status === "failed" && existing.error?.startsWith(LEGACY_AUTO_RELEASE_NOTE)) {
+        await markUnknown(tx, existing.id, "legacy automatic release requires manual reconciliation and resend authorization");
+        return { kind: "unknown" as const, row: existing };
+      }
       if (existing.status === "pending") {
         if (Date.now() - existing.updated_at.getTime() < PENDING_STALE_MS) return { kind: "busy" as const, row: existing };
         await markUnknown(tx, existing.id, "placeholder went stale without a recorded result");
@@ -128,28 +283,52 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
       if (existing.status === "unknown") return { kind: "unknown" as const, row: existing };
       // failed: the provider did not take the request, or its answer was unusable; a new attempt is allowed.
       await checkBudget(tx, req.service);
+      const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
+      await verifyGrants();
       const [r] = await tx<{ attempts: number }[]>`
         UPDATE receipts SET status = 'pending', attempts = attempts + 1, error = NULL, updated_at = now() WHERE id = ${existing.id} RETURNING attempts`;
       const attemptId = await startAttempt(tx, existing.id, r!.attempts, req);
-      return { kind: "call" as const, id: existing.id, attemptId };
+      // Recheck after writes: a blocked insert must not consume an authorization that expired
+      // while waiting for a database lock. A failure rolls the reservation and lease back.
+      await verifyGrants();
+      return { kind: "call" as const, id: existing.id, attemptId, leaseId };
     }
     await checkBudget(tx, req.service);
+    const leaseId = req.quota ? await claimProviderQuota(tx, req.quota) : null;
+    await verifyGrants();
     const [row] = await tx<{ id: number }[]>`
       INSERT INTO receipts (logical_key, service, model, purpose, subject, status, request, attempts)
       VALUES (${logicalKey}, ${req.service}, ${req.model ?? null}, ${req.purpose}, ${req.subject ?? null}, 'pending',
               ${tx.json((req.requestSummary ?? {}) as never)}, 1)
       RETURNING id`;
     const attemptId = await startAttempt(tx, row!.id, 1, req);
-    return { kind: "call" as const, id: row!.id, attemptId };
+    await verifyGrants();
+    return { kind: "call" as const, id: row!.id, attemptId, leaseId };
   });
+
+  // Retry only unsent admission, outside any transaction/connection. A short interval between
+  // consecutive steps need not defer the entire task. The HTTP callback is still invoked once;
+  // longer cooldowns/contention are reported to the caller for later recovery.
+  const waitDeadline = Date.now() + 2100;
+  let claimed: Awaited<ReturnType<typeof claim>>;
+  for (let waits = 0; ; waits++) {
+    try { claimed = await claim(); break; }
+    catch (error) {
+      if (!(error instanceof ProviderDeferredError)) throw error;
+      const waitMs = Math.max(1, error.retryAt.getTime() - Date.now());
+      if (waits >= 2 || waitMs > 1100 || Date.now() + waitMs > waitDeadline) throw error;
+      await delay(waitMs, undefined, { signal: shutdownSignal.signal });
+    }
+  }
 
   if (claimed.kind === "reuse") return { receiptId: claimed.row.id, response: claimed.row.response, reused: true };
   if (claimed.kind === "busy") throw new ReceiptBusyError(`Receipt ${claimed.row.id} is in flight`);
+  if (claimed.kind === "ambiguous") throw new LegacyReceiptAmbiguousError(`Historical receipt ${claimed.row.id} has an unresolved ambiguous identity`);
   if (claimed.kind === "unknown") {
-    throw new ReceiptUnknownError(claimed.row.id, `Receipt ${claimed.row.id} has an unknown outcome; it is released once automatically, then from the admin`);
+    throw unknownOutcome(claimed.row.id);
   }
 
-  const { id: receiptId, attemptId } = claimed;
+  const { id: receiptId, attemptId, leaseId } = claimed;
   const started = Date.now();
   let outcome: CallOutcome;
   try {
@@ -157,35 +336,74 @@ export async function paidRequest(req: ReceiptRequest, call: () => Promise<CallO
   } catch (error) {
     const status = error instanceof ProviderRejectedError ? "failed" : "unknown";
     // "unknown": the request may have reached the provider (timeout, reset): do not re-send automatically.
-    const message = (error instanceof ProviderRejectedError ? error.message : String(error)).slice(0, 2000);
-    await sql.begin(async (tx) => {
-      await tx`UPDATE receipts SET status = ${status}, error = ${message}, updated_at = now() WHERE id = ${receiptId}`;
-      await tx`UPDATE receipt_attempts SET status = ${status}, error = ${message}, latency_ms = ${Date.now() - started}, finished_at = now() WHERE id = ${attemptId}`;
-    });
-    throw error;
+    // Unknown errors may contain URLs, headers, credentials or DB parameters. Persist and expose
+    // only a fixed diagnostic and the receipt id; never attach the original error as a cause.
+    const message = error instanceof ProviderRejectedError ? error.message.slice(0, 2000) : "provider outcome unknown after send";
+    try {
+      await sql.begin(async (tx) => {
+        if (req.quota && leaseId && error instanceof ProviderRejectedError) {
+          if (error.status === 429) error.retryAfterSeconds = await coolDownProviderQuota(tx, req.quota, error.retryAfterSeconds);
+          await finishProviderQuota(tx, req.quota, leaseId, false);
+        }
+        await tx`UPDATE receipts SET status = ${status}, error = ${message}, updated_at = now() WHERE id = ${receiptId}`;
+        await tx`UPDATE receipt_attempts SET status = ${status}, error = ${message}, latency_ms = ${Date.now() - started}, finished_at = now() WHERE id = ${attemptId}`;
+      });
+    } catch {
+      // Even a failed status write must identify the reserved receipt to queue recovery.
+      throw unknownOutcome(receiptId);
+    }
+    if (status === "unknown") throw unknownOutcome(receiptId);
+    throw error; // preserve rejection/429 classification and cooldown for existing callers
   }
 
-  await sql.begin(async (tx) => {
-    await tx`
-      UPDATE receipts SET
-        status = 'received',
-        response = ${tx.json((outcome.response ?? null) as never)},
-        request_id = ${outcome.requestId ?? null},
-        usage = ${outcome.usage ? tx.json(outcome.usage as never) : null},
-        cost = ${outcome.cost?.amount ?? null},
-        currency = ${outcome.cost?.currency ?? null},
-        cost_basis = ${outcome.cost?.basis ?? null},
-        received_at = now(),
-        updated_at = now()
-      WHERE id = ${receiptId}`;
-    await tx`
-      UPDATE receipt_attempts SET
-        status = 'received', request_id = ${outcome.requestId ?? null}, usage = ${outcome.usage ? tx.json(outcome.usage as never) : null},
-        cost = ${outcome.cost?.amount ?? null}, currency = ${outcome.cost?.currency ?? null}, cost_basis = ${outcome.cost?.basis ?? null},
-        latency_ms = ${Date.now() - started}, finished_at = now()
-      WHERE id = ${attemptId}`;
-  });
+  try {
+    await sql.begin(async (tx) => {
+      if (req.quota && leaseId) await finishProviderQuota(tx, req.quota, leaseId, true);
+      await tx`
+        UPDATE receipts SET
+          status = 'received',
+          response = ${tx.json((outcome.response ?? null) as never)},
+          request_id = ${outcome.requestId ?? null},
+          usage = ${outcome.usage ? tx.json(outcome.usage as never) : null},
+          cost = ${outcome.cost?.amount ?? null},
+          currency = ${outcome.cost?.currency ?? null},
+          cost_basis = ${outcome.cost?.basis ?? null},
+          received_at = now(),
+          updated_at = now()
+        WHERE id = ${receiptId}`;
+      await tx`
+        UPDATE receipt_attempts SET
+          status = 'received', request_id = ${outcome.requestId ?? null}, usage = ${outcome.usage ? tx.json(outcome.usage as never) : null},
+          cost = ${outcome.cost?.amount ?? null}, currency = ${outcome.cost?.currency ?? null}, cost_basis = ${outcome.cost?.basis ?? null},
+          latency_ms = ${Date.now() - started}, finished_at = now()
+        WHERE id = ${attemptId}`;
+    });
+  } catch {
+    // A response may have been paid for even if encoding/storage (or its commit acknowledgement)
+    // failed. Best effort only: a DB outage leaves pending, which still blocks sending and becomes
+    // unknown on recovery. Never downgrade a received/completed answer after an ambiguous commit.
+    // A committed response whose acknowledgement was lost can still finish this business run,
+    // but only after the receipt AND this attempt prove that the saved answer is complete.
+    const recovered = await sql.begin(async (tx) => {
+      const changed = await tx`UPDATE receipts SET status = 'unknown', error = 'response persistence outcome unknown', updated_at = now()
+        WHERE id = ${receiptId} AND status = 'pending' RETURNING id`;
+      if (changed.length) await tx`UPDATE receipt_attempts SET status = 'unknown', error = 'response persistence outcome unknown',
+        latency_ms = ${Date.now() - started}, finished_at = now() WHERE id = ${attemptId} AND status = 'pending'`;
+      const [saved] = await tx<{ response: unknown }[]>`
+        SELECT r.response FROM receipts r JOIN receipt_attempts a ON a.receipt_id = r.id
+        WHERE r.id = ${receiptId} AND r.status IN ('received', 'completed') AND r.received_at IS NOT NULL
+          AND r.response IS NOT NULL AND r.response <> 'null'::jsonb
+          AND a.id = ${attemptId} AND a.attempt = r.attempts AND a.status = 'received' AND a.finished_at IS NOT NULL`;
+      return saved;
+    }).catch(() => undefined);
+    if (recovered) return { receiptId, response: recovered.response, reused: true };
+    throw unknownOutcome(receiptId);
+  }
   return { receiptId, response: outcome.response, reused: false };
+}
+
+function unknownOutcome(receiptId: number): ReceiptUnknownError {
+  return new ReceiptUnknownError(receiptId, `Receipt ${receiptId} has an unknown outcome; reconcile with the provider and explicitly authorize a resend from the admin`);
 }
 
 async function startAttempt(tx: Db, receiptId: number, attempt: number, req: ReceiptRequest): Promise<number> {
@@ -202,7 +420,7 @@ async function markUnknown(tx: Db, receiptId: number, reason: string) {
 
 /**
  * Placeholders left behind by a process that stopped mid-request (crash, kill) become "unknown", so
- * they are released like any other unknown outcome even when nothing retries them.
+ * they wait for reconciliation and explicit authorization even when nothing retries them.
  */
 export async function markStalePendingReceipts(): Promise<number> {
   const reason = "placeholder went stale without a recorded result";
@@ -226,7 +444,8 @@ export async function markStalePendingReceipts(): Promise<number> {
 export async function releaseUnknownReceipt(db: Db, id: number, error: string): Promise<{ subject: string | null; purpose: string } | null> {
   const [released] = await db<{ subject: string | null; purpose: string }[]>`
     UPDATE receipts SET status = 'failed', error = ${error}, updated_at = now() WHERE id = ${id} AND status = 'unknown' RETURNING subject, purpose`;
-  if (released) await db`UPDATE receipt_attempts SET status = 'failed', error = ${error} WHERE receipt_id = ${id} AND status = 'unknown'`;
+  // The attempt's outcome is still unknown. Billing reconciliation and permission for a NEW attempt
+  // belong in the atomic receipt.release audit, not in a rewrite of the historical paid attempt.
   return released ?? null;
 }
 

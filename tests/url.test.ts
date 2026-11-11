@@ -1,3 +1,4 @@
+import { listenForFetch } from "./http-fixture.ts";
 // The fetch guard: internal addresses stay unreachable in every spelling, and a name that resolves
 // to one is refused at connect time too (DNS rebinding after the URL check).
 import assert from "node:assert/strict";
@@ -8,7 +9,7 @@ import { guardedFetch } from "@aihot/backend/lib/http-fetch";
 import { assertPublicUrl, guardedLookup, isBlockedAddress, isInternalAddress } from "@aihot/backend/lib/url";
 
 const server = http.createServer((_req, res) => res.end("internal"));
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+await listenForFetch(server);
 const { port } = server.address() as { port: number };
 const agent = new Agent({ connect: { lookup: guardedLookup as never } });
 after(async () => {
